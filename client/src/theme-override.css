@@ -1,0 +1,85 @@
+/* Confido AI - Orange/Amber Theme Overrides */
+
+/* Global background for all pages */
+body {
+    background: black !important;
+}
+
+/* Interview Page Styling */
+.interview-container {
+    background: linear-gradient(to bottom, black, #0f172a, black) !important;
+}
+
+/* Add animated orange glow background to main content areas */
+.min-h-screen,
+.min-h-\\[calc\\(100vh-64px\\)\\] {
+    position: relative;
+}
+
+.min-h-screen::before,
+.min-h-\\[calc\\(100vh-64px\\)\\]::before {
+    content: '';
+    position: absolute;
+    top: 25%;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 600px;
+    height: 600px;
+    background: rgba(249, 115, 22, 0.2);
+    border-radius: 50%;
+    filter: blur(120px);
+    animation: pulse 4s ease-in-out infinite;
+    z-index: -1;
+    pointer-events: none;
+}
+
+/* Update all cards to have backdrop blur and orange hover */
+.bg-slate-900 {
+    background-color: rgba(15, 23, 42, 0.5) !important;
+    backdrop-filter: blur(12px);
+    transition: all 0.3s ease;
+}
+
+.bg-slate-900:hover {
+    border-color: rgba(249, 115, 22, 0.3) !important;
+}
+
+/* Update buttons to orange/amber gradient */
+.bg-blue-600,
+.bg-gradient-to-r.from-blue-600 {
+    background: linear-gradient(to right, #f97316, #f59e0b) !important;
+}
+
+.bg-blue-600:hover,
+.bg-gradient-to-r.from-blue-600:hover {
+    background: linear-gradient(to right, #ea580c, #d97706) !important;
+}
+
+/* Update accent colors to orange */
+.text-blue-400,
+.text-blue-500 {
+    color: #fb923c !important;
+}
+
+.border-blue-500 {
+    border-color: #f97316 !important;
+}
+
+/* Update shadows to orange */
+.shadow-blue-500\\/20,
+.shadow-blue-500\\/50 {
+    box-shadow: 0 10px 15px -3px rgba(249, 115, 22, 0.2) !important;
+}
+
+/* Pulse animation for glow */
+@keyframes pulse {
+
+    0%,
+    100% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.5;
+    }
+}
