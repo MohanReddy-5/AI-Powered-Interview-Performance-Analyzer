@@ -231,9 +231,3 @@ Deploy to any platform that supports Python (Railway, Render, Fly.io). Set `GEMI
 
 This project is open source. See [LICENSE](LICENSE) for details.
 
----
-
-<div align="center">
-  <strong>Built with ❤️ by Sai Srinivas Rayapati</strong><br/>
-  <em>Confido AI — Build Confidence for Interviews</em>
-</div>
