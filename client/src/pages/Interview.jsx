@@ -1,10 +1,10 @@
 import React, { useRef, useState, useEffect } from 'react';
 import Webcam from 'react-webcam';
 import Layout from '../components/Layout';
-import { Square, Play, RefreshCw, Loader2, Key, CheckCircle, AlertCircle, Volume2, Mic, MicOff } from 'lucide-react';
+import { Square, Play, RefreshCw, Loader2, Key, CheckCircle, AlertCircle, Volume2, VolumeX, Mic, MicOff, Clock } from 'lucide-react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { loadModels, detectEyeContact } from '../services/aiModels';
-import { analyzeContent } from '../services/llmService';
+// llmService no longer needed — Gemini calls go through server
 import { analyzeLocally } from '../services/localAnalysis';
 import { analyzeWithGemini } from '../services/geminiAnalysis';
 import { interviewAPI } from '../services/apiClient';
@@ -19,8 +19,8 @@ const Interview = () => {
     const location = useLocation();
 
     // -- Setup State --
-    const [apiKey, setApiKey] = useState(location.state?.apiKey || localStorage.getItem('gemini_key') || "");
-    const [showKeyModal, setShowKeyModal] = useState(!apiKey);
+    const [apiKey, setApiKey] = useState(location.state?.apiKey || localStorage.getItem('gemini_api_key') || "");
+    // showKeyModal removed — server handles API key securely
     const [sessionId, setSessionId] = useState(null);
     const [domainTitle, setDomainTitle] = useState("General");
 
@@ -44,6 +44,10 @@ const Interview = () => {
     const answersRef = useRef({}); // Store raw answers for batch analysis
     const [voiceStatus, setVoiceStatus] = useState('idle'); // idle, listening, no-speech, error, restarting
 
+    // -- Voice Mute State --
+    const [isMuted, setIsMuted] = useState(false);
+    const isMutedRef = useRef(false); // Ref mirror to avoid stale closure in speakQuestion
+
     // -- Text Input Mode (Fallback for voice issues) --
     const [useTextMode, setUseTextMode] = useState(false);
     const [textAnswer, setTextAnswer] = useState("");
@@ -58,8 +62,18 @@ const Interview = () => {
     const sessionCumulativeScore = useRef(0);
     const sessionTotalFrames = useRef(0);
 
+    // -- Timer Tracking --
+    const [elapsedTime, setElapsedTime] = useState(0); // live display counter (seconds)
+    const questionStartTimeRef = useRef(null); // precise start time for current question
+    const questionTimingsRef = useRef([]); // array of { questionId, questionText, durationSeconds }
+    const interviewStartTimeRef = useRef(null); // overall interview start time
+
     // 1. Initialize Session & AI
+    const initCalledRef = useRef(false); // Guard against React StrictMode double-mount
     useEffect(() => {
+        if (initCalledRef.current) return; // Already initialized — skip duplicate call
+        initCalledRef.current = true;
+
         const init = async () => {
             // Load Domain & RANDOMIZE Questions
             const selectedDomainId = location.state?.domain?.id || domains[0].id; // default to first if missing
@@ -103,9 +117,16 @@ const Interview = () => {
         if (!text) return;
         window.speechSynthesis.cancel();
 
+        // Check mute state via ref (avoids stale closure)
+        if (isMutedRef.current) {
+            console.log('🔇 Voice muted — skipping speech');
+            return;
+        }
+
         const utterance = new SpeechSynthesisUtterance(text);
-        utterance.rate = 0.9; // Smoother, slower pace
-        utterance.pitch = 1.0; // Natural pitch
+        utterance.rate = 0.85; // Slightly slower for more natural human-like pace
+        utterance.pitch = 1.05; // Slightly higher for warmer, more natural tone
+        utterance.volume = 1.0;
         utterance.lang = 'en-US';
 
         // Wait for voices to load (Chrome quirk)
@@ -123,13 +144,39 @@ const Interview = () => {
     };
 
     const setVoice = (utterance, voices) => {
-        // Priority: Samantha (Mac), Google US English (Chrome), Zira (Win), or any Female English
-        const preferred = voices.find(v =>
-            v.name.includes('Samantha') ||
-            v.name.includes('Google US English') ||
-            v.name.includes('Microsoft Zira')
+        // Priority list: most natural-sounding voices first
+        // 1. Google UK English Female (very natural, Chrome)
+        // 2. Microsoft Aria (natural, Edge/Windows)
+        // 3. Karen (Mac, Australian English — very clear)
+        // 4. Samantha (Mac, US English)
+        // 5. Google US English (Chrome fallback)
+        // 6. Any English female voice
+        const priorityNames = [
+            'Google UK English Female',
+            'Microsoft Aria',
+            'Karen',
+            'Samantha',
+            'Google US English',
+            'Microsoft Zira',
+        ];
+
+        for (const name of priorityNames) {
+            const match = voices.find(v => v.name.includes(name));
+            if (match) {
+                utterance.voice = match;
+                console.log('🔊 Using voice:', match.name);
+                return;
+            }
+        }
+
+        // Fallback: any English female voice
+        const englishVoice = voices.find(v =>
+            v.lang.startsWith('en') && (v.name.toLowerCase().includes('female') || v.name.includes('Fiona') || v.name.includes('Moira'))
         );
-        if (preferred) utterance.voice = preferred;
+        if (englishVoice) {
+            utterance.voice = englishVoice;
+            console.log('🔊 Using fallback English voice:', englishVoice.name);
+        }
     };
 
     // 2. Initialize Voice Capture Manager + Request Mic Permission Immediately
@@ -240,6 +287,10 @@ const Interview = () => {
 
     const handleStart = async () => {
         window.speechSynthesis.cancel(); // Stop reading if user interrupts
+
+        // Wait briefly for speech audio to fully stop so the mic doesn't capture it
+        await new Promise(resolve => setTimeout(resolve, 300));
+
         setTranscript("");
         setFinalTranscript("");
         setTextAnswer("");
@@ -249,6 +300,14 @@ const Interview = () => {
         setTotalFrames(0);
         setStartTime(Date.now());
         setIsRecording(true);
+
+        // Timer tracking
+        const now = Date.now();
+        questionStartTimeRef.current = now;
+        if (!interviewStartTimeRef.current) {
+            interviewStartTimeRef.current = now; // First question = interview start
+        }
+        setElapsedTime(0); // reset per-question live timer
 
         // If text mode, just start recording state
         if (useTextMode) {
@@ -279,6 +338,21 @@ const Interview = () => {
 
     const handleStop = async () => {
         setIsRecording(false);
+
+        // Record question timing
+        if (questionStartTimeRef.current) {
+            const durationMs = Date.now() - questionStartTimeRef.current;
+            const currentQ = questions[currentQIndex];
+            questionTimingsRef.current = [
+                ...questionTimingsRef.current,
+                {
+                    questionId: currentQ?.id,
+                    questionText: currentQ?.text || `Question ${currentQIndex + 1}`,
+                    durationSeconds: Math.round(durationMs / 1000)
+                }
+            ];
+            questionStartTimeRef.current = null;
+        }
 
         // Get transcript from either voice or text mode
         let capturedTranscript = '';
@@ -397,32 +471,26 @@ const Interview = () => {
         const telemetry = { wpm, fillerCount, eyeContactScore };
         const emotionData = { dominant: dominantEmotion, history: emotionCounts };
 
-        // === GEMINI-POWERED ANALYSIS (95% Accuracy) ===
-        if (apiKey && apiKey.length > 20) {
-            try {
-                console.log('🤖 Using Gemini for analysis...');
-                analysis = await analyzeWithGemini({
-                    transcript: capturedTranscript,
-                    question: currentQ.text,
-                    ideal_answer: currentQ.ideal,
-                    audio_blob: audioBlob,
-                    apiKey: apiKey
-                });
+        // === HYBRID ANALYSIS (Server-side Gemini + Local scoring) ===
+        try {
+            console.log('🤖 Using hybrid analysis (server-side Gemini)...');
+            analysis = await analyzeWithGemini({
+                transcript: capturedTranscript,
+                question: currentQ.text,
+                ideal_answer: currentQ.ideal,
+                audio_blob: audioBlob
+            });
 
-                // Update transcript if Gemini transcribed it
-                if (analysis.transcript && !capturedTranscript) {
-                    capturedTranscript = analysis.transcript;
-                    // Update ref with better transcript
-                    if (answersRef.current[currentQ.id]) {
-                        answersRef.current[currentQ.id] = analysis.transcript;
-                    }
+            // Update transcript if Gemini transcribed it
+            if (analysis.transcript && !capturedTranscript) {
+                capturedTranscript = analysis.transcript;
+                // Update ref with better transcript
+                if (answersRef.current[currentQ.id]) {
+                    answersRef.current[currentQ.id] = analysis.transcript;
                 }
-            } catch (err) {
-                console.error("Gemini Error:", err);
-                analysis = await analyzeLocally(capturedTranscript, currentQ.text, { title: domainTitle }, currentQ.ideal);
             }
-        } else {
-            console.log("No API Key - using local analysis");
+        } catch (err) {
+            console.error("Hybrid analysis error:", err);
             analysis = await analyzeLocally(capturedTranscript, currentQ.text, { title: domainTitle }, currentQ.ideal);
         }
 
@@ -441,8 +509,7 @@ const Interview = () => {
                         ? (sessionCumulativeScore.current / sessionTotalFrames.current) // decimal 0-1
                         : 0,
                     currentQ.ideal || '', // Pass ideal answer for results page
-                    audioBlob, // Pass audio blob for server-side Whisper transcription
-                    apiKey    // Pass user's Gemini key so server uses it for LLM scoring
+                    audioBlob // Pass audio blob for server-side Whisper transcription
                 );
 
                 // Store analysis result for local state/debugging if backend returns it
@@ -499,6 +566,7 @@ const Interview = () => {
         if (currentQIndex < questions.length - 1) {
             const nextIndex = currentQIndex + 1;
             setCurrentQIndex(nextIndex);
+            setElapsedTime(0); // Reset timer display for next question
             // Auto-Speak Next Question
             setTimeout(() => speakQuestion(questions[nextIndex]?.text), 1000);
         } else {
@@ -567,6 +635,11 @@ const Interview = () => {
                     // SESSION-LEVEL eye contact — uses accumulated data from ALL questions
                     eyeContactScore: sessionTotalFrames.current > 0
                         ? Math.round((sessionCumulativeScore.current / sessionTotalFrames.current) * 100)
+                        : 0,
+                    // Timer data
+                    questionTimings: questionTimingsRef.current,
+                    totalDurationSeconds: interviewStartTimeRef.current
+                        ? Math.round((Date.now() - interviewStartTimeRef.current) / 1000)
                         : 0
                 };
 
@@ -625,18 +698,13 @@ const Interview = () => {
             let evaluation = null;
 
             try {
-                if (apiKey && apiKey.length > 20) {
-                    // Add delay to avoid rate limiting
-                    await delay(2000);
-                    evaluation = await analyzeWithGemini({
-                        transcript: transcript,
-                        question: questionText,
-                        ideal_answer: idealAnswer,
-                        apiKey: apiKey
-                    });
-                } else {
-                    evaluation = await analyzeLocally(transcript, questionText, { title: domainTitle }, idealAnswer);
-                }
+                // Add delay to avoid rate limiting
+                await delay(2000);
+                evaluation = await analyzeWithGemini({
+                    transcript: transcript,
+                    question: questionText,
+                    ideal_answer: idealAnswer
+                });
             } catch (err) {
                 console.warn(`Analysis failed for ${qId}:`, err.message);
             }
@@ -683,35 +751,39 @@ const Interview = () => {
     };
 
     const handleRepeatQuestion = () => {
+        if (isMutedRef.current) return; // Respect mute state
         speakQuestion(questions[currentQIndex]?.text);
+    };
+
+    // Keep mute ref in sync with state
+    useEffect(() => {
+        isMutedRef.current = isMuted;
+        if (isMuted) {
+            window.speechSynthesis.cancel(); // Stop any ongoing speech immediately
+        }
+    }, [isMuted]);
+
+    // Live elapsed timer (ticks every second while recording)
+    useEffect(() => {
+        let timer;
+        if (isRecording) {
+            timer = setInterval(() => {
+                setElapsedTime(prev => prev + 1);
+            }, 1000);
+        }
+        return () => clearInterval(timer);
+    }, [isRecording]);
+
+    // Format seconds to MM:SS
+    const formatTime = (seconds) => {
+        const mins = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
     };
 
     return (
         <Layout>
-            {/* API Key Modal */}
-            {showKeyModal && (
-                <div className="fixed inset-0 bg-black/95 z-[100] flex items-center justify-center p-4">
-                    <div className="bg-slate-900 border border-slate-700 rounded-2xl p-8 max-w-lg w-full shadow-2xl">
-                        <h2 className="text-2xl font-bold text-white mb-4">Interview Configuration</h2>
-                        <div className="space-y-4">
-                            <input
-                                type="password"
-                                placeholder="Enter Google Gemini API Key (Free)"
-                                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-4 py-3 text-white"
-                                value={apiKey}
-                                onChange={(e) => setApiKey(e.target.value)}
-                            />
-                            <button
-                                onClick={() => setShowKeyModal(false)}
-                                className="w-full py-3 bg-gradient-to-r from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 text-white rounded-lg font-medium transition-all shadow-lg shadow-orange-500/30"
-                            >
-                                Start Interview
-                            </button>
-                            <p className="text-xs text-slate-500 text-center">Without key, we will use Local NLP Engine.</p>
-                        </div>
-                    </div>
-                </div>
-            )}
+            {/* API Key Modal removed — server handles API key securely */}
 
             <div className="max-w-5xl mx-auto px-4 py-12 min-h-[calc(100vh-64px)] flex flex-col">
 
@@ -721,6 +793,22 @@ const Interview = () => {
                         <h2 className="text-2xl font-bold text-white">{domainTitle} Interview</h2>
                         <p className="text-slate-400 text-sm">Question {currentQIndex + 1} of {questions.length}</p>
                     </div>
+                    {/* Voice Mute/Unmute Toggle */}
+                    <button
+                        onClick={() => {
+                            setIsMuted(prev => !prev);
+                            // Immediately cancel any ongoing speech
+                            window.speechSynthesis.cancel();
+                        }}
+                        className={`flex items-center gap-2 px-3 py-1.5 rounded-full border text-sm font-medium transition-all ${isMuted
+                            ? 'bg-red-500/10 border-red-500/30 text-red-400 hover:bg-red-500/20'
+                            : 'bg-green-500/10 border-green-500/30 text-green-400 hover:bg-green-500/20'
+                            }`}
+                        title={isMuted ? 'Unmute question voice' : 'Mute question voice'}
+                    >
+                        {isMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
+                        {isMuted ? 'Unmute' : 'Voice On'}
+                    </button>
                     <div className="flex items-center gap-3">
                         {/* Voice Status Indicator */}
                         {voiceStatus === 'listening' && (
@@ -870,6 +958,14 @@ const Interview = () => {
                     </div>
 
                     <div className="lg:w-64 flex flex-col justify-center gap-4">
+                        {/* Compact Timer */}
+                        <div className="flex items-center justify-center gap-2 px-3 py-2 bg-slate-900/50 rounded-xl border border-slate-800">
+                            <Clock className={`w-3.5 h-3.5 ${isRecording ? 'text-orange-400 animate-pulse' : 'text-slate-500'}`} />
+                            <span className={`text-sm font-mono font-semibold ${isRecording ? 'text-white' : 'text-slate-500'}`}>
+                                {formatTime(elapsedTime)}
+                            </span>
+                        </div>
+
                         <button
                             onClick={isRecording ? handleStop : handleStart}
                             disabled={isProcessing}

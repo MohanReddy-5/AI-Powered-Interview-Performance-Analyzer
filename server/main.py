@@ -461,11 +461,32 @@ async def submit_answer(
         "i don't have an answer", "i dont have an answer", "idk"
     ]
     lower_transcript = final_transcript.lower().strip() if final_transcript else ""
-    is_no_answer = any(
-        phrase in lower_transcript for phrase in NO_ANSWER_PHRASES)
+    transcript_word_count = len([w for w in lower_transcript.split() if len(w) > 1])
+
+    # CRITICAL FIX: Only auto-zero for short "I don't know" answers.
+    # Long answers (>20 words) that mention uncertainty briefly before explaining
+    # (e.g. "I'm not sure of the exact API but closures work by...") should
+    # proceed to the LLM which can properly score the actual explanation content.
+    if transcript_word_count <= 20:
+        is_no_answer = any(
+            phrase in lower_transcript for phrase in NO_ANSWER_PHRASES)
+    else:
+        # For long answers, only flag if the refusal phrase IS the whole answer
+        # (very little meaningful content remains after removing the phrase)
+        is_no_answer = False
+        for phrase in NO_ANSWER_PHRASES:
+            if phrase in lower_transcript:
+                without_phrase = lower_transcript.replace(phrase, '').strip()
+                remaining = [w for w in without_phrase.split() if len(w) > 2]
+                if len(remaining) < 8:
+                    is_no_answer = True
+                break  # Only check first matched phrase
+
+
     is_empty = not final_transcript or len(final_transcript.strip()) == 0
     is_too_short = len(
         meaningful_words) < MIN_MEANINGFUL_WORDS and not lower_transcript
+
 
     print(f"4️⃣  Validation checks:")
     print(f"    - Is empty: {is_empty}")
@@ -555,15 +576,9 @@ async def submit_answer(
             # Note: non-answer enforcement is handled inside LLM evaluator and fallback scorer
             # We do NOT override here to avoid double-penalizing 429-fallback responses
 
-            # Emotion Analysis
+            # Emotion Analysis (processed separately, not appended to answer feedback)
             emotion_service = get_emotion_service()
             emotion_analysis = emotion_service.analyze_emotions(emotions_data)
-
-            # Combine feedback
-            if 'feedback' in analysis:
-                analysis["feedback"] += f"\n\n**Emotion Analysis:** {emotion_analysis['feedback']}"
-            else:
-                analysis["feedback"] = f"**Emotion Analysis:** {emotion_analysis['feedback']}"
 
             if ideal_answer:
                 analysis["ideal_answer"] = ideal_answer
@@ -755,6 +770,238 @@ async def get_session_details(session_id: str, current_user: dict = Depends(get_
             status_code=403, detail="Not authorized to view this session")
 
     return {"success": True, "data": session_data}
+
+# ============================================================
+# GEMINI API PROXY (keeps API key hidden from client)
+# ============================================================
+
+
+class GeminiAnalyzeRequest(BaseModel):
+    transcript: str
+    question: str
+    ideal_answer: Optional[str] = None
+
+
+@app.post("/api/gemini-analyze")
+async def gemini_analyze(req: GeminiAnalyzeRequest, current_user: dict = Depends(get_current_user)):
+    """
+    Server-side proxy for Gemini analysis.
+    The client sends transcript + question, the server calls Gemini using its own API key.
+    This keeps the API key completely hidden from the browser.
+    """
+    import json as _json
+
+    api_key = os.environ.get('GEMINI_API_KEY', '').strip()
+    if not api_key or len(api_key) < 10:
+        raise HTTPException(status_code=500, detail="Server Gemini API key not configured")
+
+    transcript = (req.transcript or '').strip()
+    question = req.question or ''
+    ideal_answer = req.ideal_answer or ''
+
+    # If transcript is empty, return zero immediately
+    if not transcript or len(transcript) < 3:
+        return {
+            "success": True,
+            "analysis": {
+                "overall_score": 0,
+                "technical": 0,
+                "grammar": 0,
+                "accent": 0,
+                "confidence": 0,
+                "feedback": "No meaningful answer detected.",
+                "technical_feedback": "",
+                "grammar_feedback": "",
+                "missing_concepts": [],
+                "improvement_points": ["Provide a complete answer to the question."],
+                "status": "poor"
+            }
+        }
+
+    # Run speech quality analysis
+    from utils.speech_analyzer import analyze_speech_quality
+    speech_metrics = analyze_speech_quality(transcript)
+    speech_summary = speech_metrics.get('summary_for_llm', '')
+
+    # Build prompt with speech quality metrics
+    prompt = f"""You are a PRECISE and FAIR interview coach. You evaluate BOTH the content of the answer AND the delivery quality (how they said it). Do NOT inflate scores — differentiate clearly between weak, average, and strong answers.
+
+**QUESTION:** {question}
+
+**CANDIDATE'S ANSWER:** {transcript}
+
+**IDEAL ANSWER (reference for evaluation):** {ideal_answer or 'Not provided'}
+
+**SPEECH QUALITY ANALYSIS (measured from transcript):**
+{speech_summary}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — CHECK FOR NON-ANSWERS (mandatory, do this first):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+If the answer matches ANY of these → set ALL scores to 0 immediately:
+  • "I don't know", "I have no idea", "I can't answer", "skip", "pass", any refusal
+  • Empty response, just filler sounds ("um", "uh", "hmm"), or fewer than 3 real words
+  • Single words that don't demonstrate knowledge (e.g., "yes", "no", "maybe")
+  • Content COMPLETELY UNRELATED to the question (no topical connection at all)
+
+STEP 2 — SCORE ACCURATELY WITH CALIBRATION:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+This is a SPOKEN exam. Be accurate, fair, and generous for genuine understanding.
+
+SCORING SCALE (calibrated — use the FULL range):
+  0       → Non-answer, refusal, "I don't know", completely unrelated
+  5-15    → Completely off-topic or unrelated content
+  18-30   → Barely relevant, vague awareness but major confusion
+  32-48   → Shows some understanding but misses most key concepts
+  50-65   → Partial understanding, covers a few key points but incomplete
+  68-80   → Good answer, covers most concepts correctly with reasonable depth
+  82-92   → Strong, comprehensive with good technical accuracy
+  93-100  → Exceptional, covers all concepts with expert-level insight and examples
+
+DIMENSION-SPECIFIC RULES:
+• technical: Score based on ACTUAL technical accuracy. Wrong facts = low score. Vague generalities = 35-50 max. Correct explanation in own words = high score.
+• grammar: For spoken language, be lenient (65+ if understandable). Only penalize for truly unclear communication.
+• accent: Score clarity of expression and articulation (65+ if reasonably clear).
+• confidence: Score based on how structured and decisive the answer sounds. Use the speech analysis above for filler words and hedging.
+
+SPECIAL CASES:
+• BEHAVIORAL/SOFT SKILLS questions (teamwork, leadership, etc.): Any thoughtful personal answer = 65+. Genuine reflection with specific examples = 75+.
+• SHORT BUT CORRECT: A brief but accurate answer can score 65-78. Conciseness is not penalized if the understanding is clear.
+• PARAPHRASING: Informal explanations of concepts get FULL credit if the understanding is correct. Correct understanding in own words = same score as textbook answer.
+• CONCEPTS EXPLAINED DIFFERENTLY: If the candidate demonstrates the right understanding, score it the same as if they used exact terminology.
+
+⚠️ CALIBRATION: A mediocre answer = 35-50. A correct but incomplete answer = 58-68. A correct and well-explained answer = 70-85. Do NOT deflate scores for correct answers.
+
+**DIMENSIONS (each 0-100):**
+- overall_score: Overall quality using the calibrated scale above
+- technical: Technical accuracy (correct content = high scores, vague generalities = 35-50 max)
+- grammar: Language quality (lenient for spoken, 65+ baseline if understandable)
+- accent: Clarity of expression
+- confidence: Decisiveness and structure
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 3 — GENERATE VARIED FEEDBACK ON CONTENT AND DELIVERY (CRITICAL):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚠️ ABSOLUTE RULE: Your feedback MUST cover BOTH content accuracy AND delivery quality.
+
+**FEEDBACK VARIETY — CRITICAL:**
+You MUST vary how you open and structure your feedback. Pick a DIFFERENT opener for each response:
+  Option A: "[Candidate's specific point] — you correctly explained [X], though [delivery/content gap]."
+  Option B: "Your understanding of [concept] came through clearly. [Delivery observation based on speech analysis]."
+  Option C: "The strongest part of your answer was [specific point]. To sharpen it, [specific improvement needed]."
+  Option D: "You demonstrated [concept] well by [specific paraphrase of their words]. [One honest delivery critique]."
+  Option E: "Solid grasp of [topic] — you covered [key point]. [Speech-quality observation from analysis data]."
+  Option F: "[Direct observation about what they said first], which shows [assessment]. [Delivery note]."
+NEVER use the same opener twice. Quote or paraphrase what the candidate ACTUALLY SAID — make feedback feel personal, not generic.
+
+**FEEDBACK rules (content + delivery):**
+- First, evaluate WHAT they said: concepts they got right, concepts they missed
+- Second, evaluate HOW they said it: filler words, hedging, structure, confidence — reference the SPEECH QUALITY ANALYSIS data above
+- If the candidate explained the concept correctly but used different words than the ideal, give FULL credit
+- MUST be unique to THIS answer — never write generic advice like "study more" or "mention keyword X"
+
+**IMPROVEMENT_POINTS rules (3 specific, actionable coaching tips):**
+- Mix CONTENT tips and DELIVERY tips (not all one type)
+- Content: name the exact concept they missed or misexplained, and what the correct explanation is
+- Delivery: call out a specific habit from speech analysis (e.g., "You said 'I think' 3 times — replace with confident assertions")
+- Action-oriented: tell them WHAT TO DO, not just what was wrong
+- BAD: ["Study the topic more", "Include 'polymorphism'"]
+- GOOD: ["You said 'I think' twice — replace with 'Closures work by...' to sound confident", "Add a concrete example like a counter function to make closures tangible", "Structure: define the term → explain how it works → give a real-world use case"]
+
+**MISSING_CONCEPTS rules:**
+- List ONLY concepts present in the ideal answer but ABSENT from the candidate's answer
+
+Return ONLY valid JSON (no markdown, no code fences):
+{{
+  "overall_score": <0-100>,
+  "technical": <0-100>,
+  "grammar": <0-100>,
+  "accent": <0-100>,
+  "confidence": <0-100>,
+  "feedback": "<2-3 sentences covering content accuracy AND delivery quality, referencing what the candidate actually said>",
+  "technical_feedback": "<1 sentence on what was technically correct/incorrect>",
+  "grammar_feedback": "<1 sentence on their communication/delivery style, referencing speech analysis>",
+  "missing_concepts": ["<specific concept from ideal answer not in candidate's answer>"],
+  "improvement_points": ["<specific content or delivery coaching tip for THIS answer>"],
+  "status": "<excellent|good|fair|poor>"
+}}"""
+
+    # Call Gemini with model fallback (same logic as client-side)
+    try:
+        genai, types = None, None
+        try:
+            from google import genai as _genai_module
+            from google.genai import types as _genai_types
+            genai = _genai_module
+            types = _genai_types
+        except ImportError:
+            # Fallback to google-generativeai package
+            pass
+
+        if genai:
+            client = genai.Client(api_key=api_key)
+            model_candidates = [
+                'models/gemini-2.5-flash-lite',
+                'models/gemini-flash-lite-latest',
+                'models/gemini-2.0-flash-lite',
+                'models/gemini-2.0-flash',
+                'models/gemini-flash-latest',
+            ]
+            last_error = None
+            response_text = None
+            for model_name in model_candidates:
+                try:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            temperature=0.3,
+                            response_mime_type='application/json'
+                        )
+                    )
+                    response_text = response.text
+                    break
+                except Exception as model_err:
+                    err_str = str(model_err)
+                    if '404' in err_str or 'NOT_FOUND' in err_str:
+                        last_error = model_err
+                        continue
+                    raise
+
+            if response_text is None:
+                raise last_error or Exception("All Gemini model candidates failed")
+        else:
+            raise ImportError("No google-genai package available")
+
+        # Parse response
+        import re as _re
+        text = response_text.strip()
+        text = _re.sub(r'^```(?:json)?\s*', '', text, flags=_re.MULTILINE)
+        text = _re.sub(r'\s*```$', '', text, flags=_re.MULTILINE)
+        text = text.strip()
+
+        try:
+            analysis = _json.loads(text)
+        except _json.JSONDecodeError:
+            match = _re.search(r'\{.*\}', text, _re.DOTALL)
+            if match:
+                analysis = _json.loads(match.group())
+            else:
+                raise ValueError("Could not parse Gemini response as JSON")
+
+        print(f"✅ Gemini proxy: score={analysis.get('overall_score', '?')}")
+        return {"success": True, "analysis": analysis}
+
+    except Exception as e:
+        print(f"❌ Gemini proxy error: {e}")
+        # Return error so client can fall back to local scoring
+        return {
+            "success": False,
+            "error": str(e),
+            "analysis": None
+        }
+
 
 # ============================================================
 # ADMIN ROUTES

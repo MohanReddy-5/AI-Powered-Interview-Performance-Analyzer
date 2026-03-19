@@ -204,6 +204,25 @@ def save_answer(session_id, question, transcript, feedback_json, score, emotions
 
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
+
+        # Deduplicate: if an answer for this session+question_id already exists, UPDATE it
+        if question_id:
+            c.execute("SELECT id FROM answers WHERE session_id = ? AND question_id = ?",
+                      (session_id, question_id))
+            existing = c.fetchone()
+            if existing:
+                c.execute('''UPDATE answers 
+                             SET question = ?, user_transcript = ?, ai_feedback = ?, score = ?, 
+                                 emotion_summary = ?, audio_filename = ?, created_at = ?
+                             WHERE session_id = ? AND question_id = ?''',
+                          (question, transcript, feedback_str, score, emotions_str, audio_filename,
+                           datetime.now().isoformat(), session_id, question_id))
+                conn.commit()
+                conn.close()
+                print(
+                    f"💾 Answer UPDATED (existing row, session={session_id[:8]}..., question_id={question_id}, score={score})")
+                return True
+
         c.execute('''INSERT INTO answers 
                      (session_id, question_id, question, user_transcript, ai_feedback, score, emotion_summary, audio_filename, created_at) 
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
@@ -243,9 +262,16 @@ def get_session_results(session_id):
 
     session = dict(session_row)
 
-    # Get all answers for this session
+    # Get all answers for this session (deduplicated by question_id — keep latest)
     c.execute(
-        "SELECT * FROM answers WHERE session_id = ? ORDER BY created_at", (session_id,))
+        """SELECT * FROM answers 
+           WHERE session_id = ? 
+           AND id IN (
+               SELECT MAX(id) FROM answers 
+               WHERE session_id = ? 
+               GROUP BY COALESCE(question_id, id)
+           )
+           ORDER BY created_at""", (session_id, session_id))
     answer_rows = c.fetchall()
 
     answers = []

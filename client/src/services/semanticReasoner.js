@@ -5,9 +5,11 @@
  */
 
 /**
- * Comprehensive conceptual equivalence database
- * Maps concepts to all the ways humans might express them
+ * Comprehensive conceptual equivalence database — EXPANDED
+ * Maps 38 key concepts to all the ways humans might express them.
+ * This is the core intelligence: recognizing paraphrased/informal correct answers.
  */
+
 const CONCEPTUAL_EQUIVALENCE = {
     // Virtual DOM concepts
     'in-memory representation': {
@@ -154,8 +156,241 @@ const CONCEPTUAL_EQUIVALENCE = {
             'increase capacity', 'beefier server'
         ],
         core_meaning: 'Making a single machine more powerful'
+    },
+
+    // Promise / async-await
+    'promise chaining': {
+        equivalents: [
+            '.then()', 'then chain', 'chain of thens',
+            'then and catch', 'promise chain', 'chained promises',
+            'sequential async', 'async operations in sequence',
+            'one after another', 'after the promise resolves'
+        ],
+        core_meaning: 'Executing async operations sequentially using .then()'
+    },
+
+    'async await': {
+        equivalents: [
+            'async function', 'await keyword', 'async/await',
+            'write async like sync', 'looks like synchronous',
+            'wait for promise', 'pause execution', 'syntactic sugar',
+            'cleaner than promises', 'easier to read'
+        ],
+        core_meaning: 'Syntax for writing asynchronous code that looks synchronous'
+    },
+
+    // React hooks
+    'useState hook': {
+        equivalents: [
+            'usestate', 'useState', 'managing component state',
+            'state variable', 'state and setter', 'reactive variable',
+            'triggers re-render', 'causes re-render', 'updates component',
+            'local component state', 'component-level state'
+        ],
+        core_meaning: 'React hook for managing local component state'
+    },
+
+    'useEffect hook': {
+        equivalents: [
+            'useeffect', 'useEffect', 'side effects in react',
+            'after render', 'runs after render', 'after mount',
+            'lifecycle equivalent', 'componentdidmount equivalent',
+            'fetching data hook', 'subscriptions hook',
+            'cleanup function', 'dependency array'
+        ],
+        core_meaning: 'React hook for performing side effects after render'
+    },
+
+    'memoization': {
+        equivalents: [
+            'caching result', 'caches result', 'cached output',
+            'remember previous result', 'stores previous output',
+            'avoids recalculation', 'skip recalculation',
+            'only recalculates when inputs change', 'usememo',
+            'pure function caching', 'result caching'
+        ],
+        core_meaning: 'Caching the result of an expensive function call'
+    },
+
+    'lazy loading': {
+        equivalents: [
+            'load on demand', 'deferred loading', 'doesn\'t load upfront',
+            'load when needed', 'split the bundle',
+            'not loaded initially', 'loaded when accessed',
+            'code splitting', 'dynamic import', 'on-demand loading'
+        ],
+        core_meaning: 'Loading resources only when they are needed'
+    },
+
+    // JavaScript concepts
+    'hoisting': {
+        equivalents: [
+            'moved to top', 'declaration moved up', 'available before line',
+            'function available anywhere', 'variable declaration raised',
+            'javascript moves declarations', 'compiled phase',
+            'before execution', 'declaration phase'
+        ],
+        core_meaning: 'JavaScript moves declarations to the top of their scope'
+    },
+
+    'prototype chain': {
+        equivalents: [
+            'prototype inheritance', 'inherits from prototype',
+            'looks up the chain', 'prototype lookup',
+            '__proto__', 'object.prototype', 'inherited methods',
+            'built-in methods come from', 'chain of objects',
+            'object inherits from another object'
+        ],
+        core_meaning: 'Mechanism by which JavaScript objects inherit properties'
+    },
+
+    // Database
+    'indexing': {
+        equivalents: [
+            'database index', 'speeds up queries', 'faster search',
+            'lookup table', 'b-tree index', 'avoids full table scan',
+            'query optimization', 'indexed columns', 'faster reads'
+        ],
+        core_meaning: 'Data structure that improves query lookup speed'
+    },
+
+    'transactions': {
+        equivalents: [
+            'atomic operation', 'all or nothing', 'rollback',
+            'commit', 'acid', 'atomicity', 'consistency isolation durability',
+            'either all succeed or all fail', 'grouped operations',
+            'undone if error', 'database transaction'
+        ],
+        core_meaning: 'Set of database operations executed as a single unit'
+    },
+
+    // Security
+    'authentication': {
+        equivalents: [
+            'verify identity', 'who you are', 'logging in',
+            'login process', 'verify the user', 'prove who you are',
+            'username and password', 'credentials check', 'sign in',
+            'jwt', 'oauth', 'session token', 'access token'
+        ],
+        core_meaning: 'Verifying the identity of a user'
+    },
+
+    'authorization': {
+        equivalents: [
+            'permissions', 'access control', 'what you can do',
+            'role-based', 'rbac', 'can the user do this',
+            'allowed to access', 'restricted access', 'admin vs user',
+            'resource permission', 'access rights'
+        ],
+        core_meaning: 'Determining what actions an authenticated user can perform'
+    },
+
+    // REST API
+    'stateless': {
+        equivalents: [
+            'no server memory', 'doesn\'t remember previous requests',
+            'each request is independent', 'self-contained request',
+            'no session on server', 'server forgets',
+            'all info in the request', 'server stores nothing',
+            'independent requests'
+        ],
+        core_meaning: 'Each API request contains all information needed to process it'
+    },
+
+    // OOP
+    'encapsulation': {
+        equivalents: [
+            'hiding data', 'private fields', 'data hiding',
+            'internal state hidden', 'only expose what is needed',
+            'bundle data and methods', 'access modifiers',
+            'getter setter', 'controlled access', 'private public'
+        ],
+        core_meaning: 'Bundling data and restricting direct access to it'
+    },
+
+    'inheritance': {
+        equivalents: [
+            'extends', 'child class', 'parent class', 'base class',
+            'subclass', 'superclass', 'derives from', 'inherits from',
+            'gets properties from', 'parent to child', 'is-a relationship'
+        ],
+        core_meaning: 'A class receiving properties and methods from another class'
+    },
+
+    'polymorphism': {
+        equivalents: [
+            'same interface different behavior', 'method overriding',
+            'overriding', 'same method name different class',
+            'different implementations', 'one interface many forms',
+            'duck typing', 'runtime polymorphism', 'compile-time polymorphism'
+        ],
+        core_meaning: 'Objects of different types responding to the same interface'
+    },
+
+    // TypeScript
+    'type safety': {
+        equivalents: [
+            'type checking', 'catches type errors', 'prevents type bugs',
+            'static typing', 'typescript benefits', 'know the type at compile time',
+            'type errors caught early', 'compile-time errors', 'type annotations',
+            'reduces runtime errors', 'type enforcement'
+        ],
+        core_meaning: 'Ensuring variables hold only values of the correct type'
+    },
+
+    // CSS
+    'flexbox': {
+        equivalents: [
+            'flexible box', 'display flex', 'flex container',
+            'flex direction', 'justify content', 'align items',
+            'one dimensional layout', '1d layout', 'flex layout',
+            'flexible layout', 'flex wrap'
+        ],
+        core_meaning: 'CSS layout model for one-dimensional flexible layouts'
+    },
+
+    'css grid': {
+        equivalents: [
+            'display grid', 'grid layout', 'two-dimensional layout',
+            '2d layout', 'grid columns', 'grid rows', 'grid template',
+            'grid areas', 'grid lines', 'grid track'
+        ],
+        core_meaning: 'CSS layout system for two-dimensional grid-based layouts'
+    },
+
+    // Testing
+    'unit testing': {
+        equivalents: [
+            'testing individual functions', 'test in isolation',
+            'testing small pieces', 'jest', 'mocha', 'test a single unit',
+            'isolated test', 'mock dependencies', 'pure function test'
+        ],
+        core_meaning: 'Testing individual functions or components in isolation'
+    },
+
+    // Git
+    'version control': {
+        equivalents: [
+            'tracking changes', 'git', 'commit history',
+            'keep track of changes', 'history of code',
+            'revert changes', 'branching', 'merge', 'collaborate on code',
+            'source control', 'code history'
+        ],
+        core_meaning: 'System for tracking changes to code over time'
+    },
+
+    // Performance
+    'optimization': {
+        equivalents: [
+            'improve performance', 'make faster', 'speed up',
+            'more efficient', 'better performance',
+            'reduce time', 'decrease time', 'quicker',
+            'enhance speed', 'boost performance'
+        ],
+        core_meaning: 'Making something perform better or faster'
     }
 };
+
 
 /**
  * Reason about whether two concepts are equivalent

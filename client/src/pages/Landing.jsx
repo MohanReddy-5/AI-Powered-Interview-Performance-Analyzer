@@ -1,6 +1,6 @@
 import React from 'react';
 import { Link } from 'react-router-dom';
-import { Sparkles, Play, CheckCircle, Brain, Target, TrendingUp, LogIn, History, LogOut, User, ArrowRight, Camera, MessageSquare } from 'lucide-react';
+import { Sparkles, Play, CheckCircle, Brain, Target, TrendingUp, LogIn, History, LogOut, User, ArrowRight, Camera, MessageSquare, Timer, Mic, BarChart2 } from 'lucide-react';
 import Layout from '../components/Layout';
 import { useAuth } from '../context/AuthContext';
 
@@ -148,6 +148,21 @@ const Landing = () => {
                             icon={<MessageSquare className="text-orange-400" />}
                             title="Intelligent Feedback"
                             desc="Get detailed, actionable insights on technical accuracy, communication skills, and areas for improvement.">
+                        </FeatureCard>
+                        <FeatureCard
+                            icon={<Timer className="text-orange-400" />}
+                            title="Response Timing"
+                            desc="Track how long you spend on each question with live timers. Identify where you rush or linger to perfect your pacing.">
+                        </FeatureCard>
+                        <FeatureCard
+                            icon={<Mic className="text-orange-400" />}
+                            title="Voice Analysis"
+                            desc="Advanced speech recognition captures your voice in real-time with live transcription and natural text-to-speech question delivery.">
+                        </FeatureCard>
+                        <FeatureCard
+                            icon={<BarChart2 className="text-orange-400" />}
+                            title="Progress Tracking"
+                            desc="Review your full interview history with detailed breakdowns. Track improvement across sessions and skill dimensions over time.">
                         </FeatureCard>
                     </div>
                 </div>

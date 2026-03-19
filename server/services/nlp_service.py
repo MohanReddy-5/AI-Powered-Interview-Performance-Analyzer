@@ -106,19 +106,38 @@ class NLPService:
             }
 
         # STRICT: Check for "I don't know" type responses = 0%
+        # WORD-COUNT GUARD: Only flag if the answer is short (≤20 words).
+        # Long answers that mention uncertainty briefly before giving an explanation
+        # should NOT be zeroed — let the scoring handle them properly.
         text_lower = cleaned.lower()
         dont_know_phrases = [
             "i don't know", "i dont know", "i do not know",
-            "no idea", "not sure", "don't remember", "dont remember",
+            "no idea", "don't remember", "dont remember",
             "i'm not sure", "im not sure", "i am not sure"
         ]
-        if any(phrase in text_lower for phrase in dont_know_phrases):
-            return {
-                "score": 0,
-                "feedback": "You indicated uncertainty. Try to provide your best understanding of the concept.",
-                "status": "poor",
-                "metrics": {"word_count": word_count_raw}
-            }
+        word_count_check = len(cleaned.split())
+        if word_count_check <= 20:
+            if any(phrase in text_lower for phrase in dont_know_phrases):
+                return {
+                    "score": 0,
+                    "feedback": "You indicated uncertainty. Try to provide your best understanding of the concept.",
+                    "status": "poor",
+                    "metrics": {"word_count": word_count_raw}
+                }
+        else:
+            # Long answer: only zero if refusal phrase + very little real content remains
+            for phrase in dont_know_phrases:
+                if phrase in text_lower:
+                    without_phrase = text_lower.replace(phrase, '').strip()
+                    remaining_words = [w for w in without_phrase.split() if len(w) > 2]
+                    if len(remaining_words) < 8:
+                        return {
+                            "score": 0,
+                            "feedback": "You indicated uncertainty. Try to explain what you DO know, even if incomplete.",
+                            "status": "poor",
+                            "metrics": {"word_count": word_count_raw}
+                        }
+                    break  # Found phrase but user gave real content — continue scoring
 
         # Process text with spaCy
         doc = self.nlp(text)
@@ -204,61 +223,140 @@ class NLPService:
         }
 
     def _count_technical_terms(self, doc, domain: str) -> int:
-        """Count technical terms based on domain"""
-        # Technical keywords by domain
+        """Count technical terms based on domain — comprehensive coverage."""
         tech_keywords = {
-            "frontend": ["react", "component", "state", "props", "hook", "dom", "css", "html", "javascript", "ui", "responsive"],
-            "backend": ["api", "database", "server", "endpoint", "authentication", "query", "cache", "rest", "http"],
-            "fullstack": ["frontend", "backend", "api", "database", "component", "server"],
-            "data": ["data", "analysis", "model", "algorithm", "statistics", "python", "sql", "visualization"],
-            "behavioral": ["team", "project", "challenge", "solution", "communication", "leadership"]
+            # Frontend
+            "frontend": [
+                "react", "reactjs", "component", "state", "props", "hook", "usestate", "useeffect",
+                "useref", "usecallback", "usememo", "usecontext", "usereducer",
+                "virtual dom", "dom", "css", "html", "javascript", "typescript",
+                "responsive", "flexbox", "css grid", "media query", "ui", "ux",
+                "webpack", "vite", "babel", "jsx", "tsx", "spa", "pwa",
+                "rendering", "hydration", "lazy loading", "code splitting",
+                "vue", "angular", "svelte", "next.js", "nuxt",
+                "redux", "zustand", "mobx", "recoil", "context api",
+                "accessibility", "aria", "semantic html", "seo",
+            ],
+            # Backend
+            "backend": [
+                "api", "rest", "restful", "graphql", "grpc", "websocket",
+                "database", "sql", "nosql", "orm", "query", "index",
+                "server", "endpoint", "route", "middleware", "authentication",
+                "authorization", "jwt", "oauth", "session", "cookie",
+                "cache", "redis", "memcache", "message queue", "kafka",
+                "microservices", "monolith", "load balancer", "reverse proxy",
+                "nginx", "apache", "node", "express", "fastapi", "django",
+                "flask", "spring", "rails", "laravel",
+            ],
+            # Fullstack
+            "fullstack": [
+                "frontend", "backend", "api", "database", "component", "server",
+                "deployment", "devops", "ci/cd", "docker", "kubernetes",
+                "cloud", "aws", "gcp", "azure", "scalability", "performance",
+            ],
+            # Data / ML / AI
+            "data": [
+                "data", "analysis", "model", "algorithm", "statistics",
+                "python", "pandas", "numpy", "sklearn", "tensorflow", "pytorch",
+                "sql", "visualization", "etl", "pipeline", "feature",
+                "training", "inference", "neural network", "deep learning",
+                "clustering", "regression", "classification", "overfitting",
+            ],
+            # DevOps / Infrastructure
+            "devops": [
+                "docker", "kubernetes", "container", "pod", "cluster",
+                "ci/cd", "pipeline", "jenkins", "github actions", "terraform",
+                "ansible", "monitoring", "logging", "alerting", "prometheus",
+                "grafana", "load balancer", "auto scaling", "cloud",
+                "infrastructure", "iac", "deployment", "rollback",
+            ],
+            # System Design
+            "system": [
+                "scalability", "availability", "reliability", "latency",
+                "throughput", "load balancer", "database sharding", "replication",
+                "caching", "cdn", "message queue", "event driven", "microservices",
+                "api gateway", "service mesh", "cap theorem", "consistency",
+                "partition tolerance", "horizontal scaling", "vertical scaling",
+            ],
+            # Behavioral
+            "behavioral": [
+                "team", "project", "challenge", "solution", "communication",
+                "leadership", "collaboration", "conflict", "deadline",
+                "prioritize", "stakeholder", "agile", "scrum", "sprint",
+                "feedback", "mentoring", "ownership", "impact",
+            ],
         }
 
         domain_lower = domain.lower()
-        keywords = []
+        keywords = set()
+
+        # Collect all matching domain keywords
         for key, values in tech_keywords.items():
             if key in domain_lower:
-                keywords.extend(values)
+                keywords.update(values)
 
+        # Always include fullstack terms as baseline
         if not keywords:
-            keywords = tech_keywords.get("fullstack", [])
+            keywords.update(tech_keywords.get("fullstack", []))
 
         text_lower = doc.text.lower()
+        # Partial match: check if any keyword is a substring of the text
         count = sum(1 for keyword in keywords if keyword in text_lower)
         return count
 
     def _generate_feedback(self, metrics: Dict, score: int) -> str:
-        """Generate contextual feedback based on metrics"""
+        """Generate specific, actionable feedback based on spaCy metrics."""
         feedback_parts = []
 
-        # Length feedback - Context aware!
-        if metrics["word_count"] < 30:
-            if score > 70:
+        # Length feedback — context aware
+        word_count = metrics["word_count"]
+        if word_count < 20:
+            if score >= 70:
                 feedback_parts.append(
-                    "Concise and precise answer! You covered key points efficiently.")
+                    "Concise and precise — you covered key concepts efficiently. "
+                    "Consider adding a brief example to make it even stronger.")
             else:
                 feedback_parts.append(
-                    "Your answer is quite brief. Aim for more detail or examples.")
-        elif metrics["word_count"] > 150:
+                    f"Your answer was brief ({word_count} words). Aim for at least 40 words "
+                    "with a definition, explanation, and one real-world example.")
+        elif word_count > 200:
             feedback_parts.append(
-                "Good detail! Be mindful of keeping answers concise.")
+                "Thorough answer — be mindful of length in real interviews; "
+                "aim to make the key point in 60–100 words.")
         else:
-            feedback_parts.append("Good answer length.")
+            feedback_parts.append(f"Good answer length ({word_count} words).")
 
-        # Vocabulary feedback
+        # Vocabulary diversity
         vocab_ratio = metrics["unique_words"] / max(metrics["word_count"], 1)
-        if vocab_ratio < 0.5:
-            feedback_parts.append("Try using more varied vocabulary.")
-        else:
-            feedback_parts.append("Good vocabulary diversity.")
+        if vocab_ratio < 0.45:
+            feedback_parts.append(
+                "Vocabulary is repetitive — try to use synonyms or different terms "
+                "to show breadth of knowledge.")
+        elif vocab_ratio >= 0.7:
+            feedback_parts.append("Strong vocabulary diversity — well-varied language.")
 
-        # Technical terms
-        if metrics["technical_terms"] < 2:
+        # Technical depth
+        tech_terms = metrics["technical_terms"]
+        if tech_terms == 0:
             feedback_parts.append(
-                "Include more domain-specific technical terms.")
+                "No domain-specific technical terms detected. "
+                "Name the exact concepts, tools, or patterns you're describing.")
+        elif tech_terms < 3:
+            feedback_parts.append(
+                f"Some technical terms used ({tech_terms}). "
+                "Include more domain-specific terminology to demonstrate expertise.")
         else:
             feedback_parts.append(
-                f"Good use of technical terminology ({metrics['technical_terms']} terms).")
+                f"Good technical depth — {tech_terms} domain-specific terms used.")
+
+        # Sentence structure
+        sentence_count = metrics.get("sentence_count", 1)
+        if sentence_count == 1 and word_count > 30:
+            feedback_parts.append(
+                "The answer was one long run-on sentence. "
+                "Break it into 2–3 clear sentences for clarity.")
+        elif sentence_count >= 3:
+            feedback_parts.append("Clear multi-sentence structure — easy to follow.")
 
         return " ".join(feedback_parts)
 

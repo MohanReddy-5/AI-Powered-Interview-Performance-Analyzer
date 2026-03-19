@@ -19,6 +19,10 @@ export const detectNonAnswer = (transcript, question) => {
     const wordCount = cleanTranscript.split(/\s+/).length;
 
     // 1. EXPLICIT NON-ANSWERS - "I don't know", "I'm not sure", etc.
+    // IMPORTANT: Only flag as non-answer if the answer is short (≤ 20 words).
+    // Long answers that mention "I don't know" in passing (e.g. "I don't know
+    // the exact syntax but responsive design uses...") should NOT be flagged —
+    // the user is providing a real explanation after the caveat.
     const explicitNonAnswers = [
         /\bi\s+don'?t\s+know\b/i,
         /\bi'?m\s+not\s+sure\b/i,
@@ -35,17 +39,37 @@ export const detectNonAnswer = (transcript, question) => {
         /\bsorry,?\s+i\s+don'?t/i
     ];
 
-    for (const pattern of explicitNonAnswers) {
-        if (pattern.test(cleanTranscript)) {
-            return { isNonAnswer: true, reason: 'explicit_non_answer', confidence: 0.98 };
+    // Only flag if answer is short — long answers deserve content evaluation
+    if (wordCount <= 20) {
+        for (const pattern of explicitNonAnswers) {
+            if (pattern.test(cleanTranscript)) {
+                return { isNonAnswer: true, reason: 'explicit_non_answer', confidence: 0.98 };
+            }
+        }
+    } else {
+        // For long answers, only flag if the ENTIRE answer is essentially a refusal
+        // (i.e., refusal phrase + ≤5 additional content words)
+        for (const pattern of explicitNonAnswers) {
+            if (pattern.test(cleanTranscript)) {
+                // Check if after removing the refusal phrase, there's meaningful content
+                const withoutRefusal = cleanTranscript.replace(pattern, '').trim();
+                const remainingWords = withoutRefusal.split(/\s+/).filter(w => w.length > 2);
+                if (remainingWords.length < 6) {
+                    // Very little content beyond the refusal — it IS a non-answer
+                    return { isNonAnswer: true, reason: 'explicit_non_answer', confidence: 0.90 };
+                }
+                // Otherwise: user mentioned uncertainty but continued with real content
+                // Do NOT flag — let Gemini score the actual explanation
+                break;
+            }
         }
     }
 
     // 2. EVASIVE RESPONSES - Avoiding the question
+    // Only flag as evasive if the answer is very short and mostly evasive
     const evasiveResponses = [
         /\bthat'?s\s+a\s+good\s+question\b/i,
         /\binteresting\s+question\b/i,
-        /\blet\s+me\s+think\b/i,
         /\bi\s+need\s+to\s+study\b/i,
         /\bi\s+should\s+review\b/i,
         /\bi'?ll\s+get\s+back\s+to\s+you\b/i,
@@ -60,8 +84,9 @@ export const detectNonAnswer = (transcript, question) => {
         }
     }
 
-    // If mostly evasive and short, it's a non-answer
-    if (evasiveCount >= 2 && wordCount < 20) {
+    // If mostly evasive and very short, it's a non-answer
+    // Raised threshold to 2 evasives + under 15 words to avoid false positives
+    if (evasiveCount >= 2 && wordCount < 15) {
         return { isNonAnswer: true, reason: 'evasive_response', confidence: 0.85 };
     }
 

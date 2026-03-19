@@ -53,8 +53,34 @@ export function isZeroScoreAnswer(transcript, question, idealAnswer) {
         "don't know what that is", "dont know what that is",
         "no clue what that means", "what is that", "what does that mean"
     ];
-    if (refusalPhrases.some(phrase => lower.includes(phrase))) {
-        return { isZero: true, reason: 'refusal', confidence: 1.0 };
+    // ── Layer 2b: Refusal phrase check with word-count guard ──
+    // CRITICAL FIX: Only flag as zero-score if answer is short (≤20 words).
+    // Long answers may briefly mention uncertainty ("I don't know the exact syntax
+    // but here's what I know...") before providing a real explanation.
+    // In those cases, let Gemini evaluate the actual explanation content.
+    const wordCount = text.split(/\s+/).length;
+
+    if (wordCount <= 20) {
+        // Short answer — any refusal phrase means it's a non-answer
+        if (refusalPhrases.some(phrase => lower.includes(phrase))) {
+            return { isZero: true, reason: 'refusal', confidence: 1.0 };
+        }
+    } else {
+        // Long answer — only flag if the refusal phrase appears at the START
+        // and there's very little content beyond it
+        for (const phrase of refusalPhrases) {
+            if (lower.includes(phrase)) {
+                // Check if after removing the refusal phrase, meaningful content remains
+                const withoutRefusal = lower.replace(phrase, '').trim();
+                const remainingWords = withoutRefusal.split(/\s+/).filter(w => w.length > 2);
+                if (remainingWords.length < 8) {
+                    // Mostly a refusal with very little explanation
+                    return { isZero: true, reason: 'refusal', confidence: 0.90 };
+                }
+                // Otherwise: user caveated but then explained — not a zero
+                break;
+            }
+        }
     }
 
     // ── Layer 3: Intent-based refusal detection (fuzzy) ──
@@ -66,9 +92,8 @@ export function isZeroScoreAnswer(transcript, question, idealAnswer) {
         /\b(never\s+(heard|learned|studied|seen|encountered))\b/i,
         /\bwhat\s+(is|are|does)\s+(that|this|it)\s*\??\s*$/i,
     ];
-    // Only flag if the whole answer is short (≤15 words) AND matches refusal intent
-    const wordCount = text.split(/\s+/).length;
-    if (wordCount <= 15 && refusalPatterns.some(p => p.test(lower))) {
+    // Only flag if the whole answer is short (≤20 words) AND matches refusal intent
+    if (wordCount <= 20 && refusalPatterns.some(p => p.test(lower))) {
         return { isZero: true, reason: 'refusal_intent', confidence: 0.95 };
     }
 
@@ -125,114 +150,56 @@ export function isZeroScoreAnswer(transcript, question, idealAnswer) {
  */
 export function scoreAnswerLocally(transcript, question, idealAnswer) {
     const text = (transcript || '').trim();
-    const ideal = (idealAnswer || '').trim();
 
-    // Step 1: Zero-score check
+    // Step 1: Zero-score check (this works well — keep it)
     const zeroCheck = isZeroScoreAnswer(text, question, idealAnswer);
     if (zeroCheck.isZero) {
         return createZeroResult(text, idealAnswer, zeroCheck.reason);
     }
 
-    // Step 2: If no ideal answer to compare against, use basic evaluation
-    if (!ideal || ideal.length < 10) {
-        return createBasicEvaluation(text, question);
-    }
+    // Step 2: Basic text quality assessment (NOT keyword matching)
+    // This provides a preliminary score based on answer substance.
+    // The REAL scoring comes from Gemini on the server.
+    const words = text.split(/\s+/).filter(w => w.length > 1);
+    const wordCount = words.length;
 
-    // Step 3: Full concept-level scoring
-    const userLower = text.toLowerCase();
-    const idealLower = ideal.toLowerCase();
-    const questionLower = (question || '').toLowerCase();
+    // Basic quality score based on answer length and substance
+    let preliminaryScore;
+    if (wordCount < 5) preliminaryScore = 20;
+    else if (wordCount < 15) preliminaryScore = 40;
+    else if (wordCount < 30) preliminaryScore = 55;
+    else if (wordCount < 60) preliminaryScore = 65;
+    else preliminaryScore = 70;
 
-    // 3a. TF-IDF Cosine Similarity
-    const cosineSim = computeCosineSimilarity(userLower, idealLower);
-
-    // 3b. N-gram Overlap (2-word and 3-word phrases)
-    const ngramScore = computeNgramOverlap(userLower, idealLower);
-
-    // 3c. Concept Coverage — what % of key concepts from ideal are covered?
-    const conceptResult = computeConceptCoverage(userLower, idealLower, questionLower);
-
-    // 3d. Answer Completeness — length ratio (penalize very short, reward thorough)
-    const userWords = userLower.split(/\s+/).filter(w => w.length > 1);
-    const idealWords = idealLower.split(/\s+/).filter(w => w.length > 1);
-    const lengthRatio = Math.min(userWords.length / Math.max(idealWords.length, 1), 1.5);
-    const completenessScore = Math.min(1.0, lengthRatio);
-
-    // 3e. Relevance to question — is the user actually addressing the question?
-    const questionRelevance = computeQuestionRelevance(userLower, questionLower);
-
-    // ── Weighted Final Score ──
-    // Weights tuned for human-like evaluation:
-    //   - Concept coverage is king (what matters most)
-    //   - Cosine similarity captures overall meaning match
-    //   - N-gram captures specific phrase usage
-    //   - Completeness rewards depth
-    //   - Question relevance ensures they're on-topic
-    let rawScore = (
-        conceptResult.coverage * 0.35 +   // Key concepts covered
-        cosineSim * 0.25 +                 // Overall meaning similarity
-        ngramScore * 0.15 +                // Phrase-level match
-        completenessScore * 0.10 +         // Answer depth
-        questionRelevance * 0.15           // On-topic check
-    );
-
-    // Scale to 0-100 with calibration
-    // Raw scores tend to cluster 0.2-0.7, so we calibrate to spread across full range
-    let finalScore = Math.round(calibrateScore(rawScore) * 100);
-    finalScore = Math.max(0, Math.min(100, finalScore));
-
-    // If concept coverage is very low AND similarity is low → likely wrong answer
-    if (conceptResult.coverage < 0.1 && cosineSim < 0.15) {
-        finalScore = Math.min(finalScore, 15);
-    }
-
-    // If coverage is high → reward generously (correct answer should get max)
-    if (conceptResult.coverage > 0.7 && cosineSim > 0.4) {
-        finalScore = Math.max(finalScore, 75);
-    }
-    if (conceptResult.coverage > 0.85 && cosineSim > 0.5) {
-        finalScore = Math.max(finalScore, 85);
-    }
-
-    // Determine status
-    const status = finalScore >= 80 ? 'excellent' : finalScore >= 60 ? 'good' : finalScore >= 40 ? 'fair' : 'poor';
-
-    // Generate human-like feedback
-    const feedback = generateFeedback(finalScore, conceptResult, cosineSim, question, text);
-    const improvementPoints = generateImprovements(conceptResult, finalScore);
-
-    // Build breakdown scores (proportional to overall but with slight variation)
-    const techScore = Math.round(Math.min(100, finalScore * (0.9 + conceptResult.coverage * 0.2)));
-    const grammarScore = Math.round(Math.min(100, Math.max(40, finalScore * 0.8 + 20))); // lenient
-    const accentScore = Math.round(Math.min(100, finalScore * (0.85 + questionRelevance * 0.2)));
-    const confScore = Math.round(Math.min(100, finalScore * (0.8 + completenessScore * 0.25)));
+    const status = preliminaryScore >= 70 ? 'good' : preliminaryScore >= 45 ? 'fair' : 'poor';
 
     return {
-        score: finalScore,
-        feedback: feedback,
-        technical_feedback: conceptResult.conceptsFeedback || '',
-        grammar_feedback: 'Local analysis — communication scoring is approximate.',
+        score: preliminaryScore,
+        feedback: 'Preliminary local assessment — detailed AI feedback is being generated by the server.',
+        technical_feedback: '',
+        grammar_feedback: '',
         status: status,
         breakdown: {
-            technical: techScore,
-            grammar: grammarScore,
-            accent: accentScore,
-            confidence: confScore,
-            // Server-side compatible names
-            knowledge: techScore,
-            relevance: accentScore,
-            clarity: grammarScore,
-            // Additional mapped names for Results.jsx
-            technical_score: techScore,
-            communication_score: grammarScore,
-            depth_score: accentScore,
-            confidence_score: confScore
+            technical: preliminaryScore,
+            grammar: Math.min(100, preliminaryScore + 10),
+            accent: preliminaryScore,
+            confidence: preliminaryScore,
+            knowledge: preliminaryScore,
+            relevance: preliminaryScore,
+            clarity: Math.min(100, preliminaryScore + 10),
+            technical_score: preliminaryScore,
+            communication_score: Math.min(100, preliminaryScore + 10),
+            depth_score: preliminaryScore,
+            confidence_score: preliminaryScore
         },
-        missing_concepts: conceptResult.missing || [],
-        improvement_points: improvementPoints,
+        missing_concepts: [],
+        improvement_points: [
+            'Detailed feedback will come from AI analysis.',
+            'Review the ideal answer after receiving your results.'
+        ],
         transcript: text,
         ideal_answer: idealAnswer || '',
-        scoring_method: 'local_concept_matcher'
+        scoring_method: 'local_preliminary'
     };
 }
 

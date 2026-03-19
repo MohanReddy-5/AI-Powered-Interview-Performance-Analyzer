@@ -116,10 +116,10 @@ const calculateGazeRatio = (eye) => {
     };
 };
 
-// ── Temporal smoothing state ──────────────────────────────────────────
+// ── Temporal smoothing state ──────────────────────────────────────────────────────
 let smoothedGazeX = 0.5;
 let smoothedGazeY = 0.5;
-const SMOOTHING_ALPHA = 0.4; // 0 = very smooth (slow), 1 = no smoothing (instant)
+const SMOOTHING_ALPHA = 0.6; // Higher = reacts faster to look-aways (was 0.4)
 
 /**
  * Detect eye contact — IRIS-BASED GAZE TRACKING version.
@@ -205,7 +205,7 @@ export const detectEyeContact = async (videoElement) => {
                 let headTurned = false;
                 if (faceWidth > 0) {
                     const deviationRatio = Math.abs(noseTipX - eyeMidX) / faceWidth;
-                    headTurned = deviationRatio > 0.35; // Head significantly turned
+                    headTurned = deviationRatio > 0.25; // Head significantly turned (stricter: was 0.35)
                 }
 
                 // 4. DETERMINE STATUS based on gaze deviation from center (0.5, 0.5)
@@ -218,14 +218,14 @@ export const detectEyeContact = async (videoElement) => {
                     // Head is significantly turned away from camera
                     status = 'looking_away';
                     score = 0.0;
-                } else if (horizDeviation < 0.06 && vertDeviation < 0.08) {
-                    // Gaze is well-centered — looking at screen/camera
+                } else if (horizDeviation < 0.04 && vertDeviation < 0.06) {
+                    // Gaze is tightly centered — looking directly at screen/camera
                     status = 'good_eye_contact';
                     score = 1.0;
-                } else if (horizDeviation < 0.12 && vertDeviation < 0.14) {
-                    // Gaze is slightly off — still mostly engaged
+                } else if (horizDeviation < 0.07 && vertDeviation < 0.09) {
+                    // Gaze is slightly off — still somewhat engaged but drifting
                     status = 'slight_drift';
-                    score = 0.5;
+                    score = 0.3;
                 } else {
                     // Gaze is clearly away from center — looking up/down/sideways
                     status = 'looking_away';
@@ -282,7 +282,7 @@ export const detectEyeContact = async (videoElement) => {
             let isLookingForward = true;
             if (faceWidth > 0) {
                 const deviationRatio = Math.abs(noseTipX - eyeMidX) / faceWidth;
-                isLookingForward = deviationRatio < 0.30;
+                isLookingForward = deviationRatio < 0.22; // Stricter head-pose check (was 0.30)
             }
 
             return {
@@ -342,13 +342,13 @@ export const detectEyeContact = async (videoElement) => {
                     const vertDeviation = Math.abs(smoothedGazeY - 0.5);
 
                     let status, score;
-                    // Slightly more generous thresholds for tiny model (less accurate landmarks)
-                    if (horizDeviation < 0.08 && vertDeviation < 0.10) {
+                    // Tighter thresholds for tiny model (proportionally stricter)
+                    if (horizDeviation < 0.05 && vertDeviation < 0.07) {
                         status = 'good_eye_contact';
                         score = 1.0;
-                    } else if (horizDeviation < 0.15 && vertDeviation < 0.17) {
+                    } else if (horizDeviation < 0.10 && vertDeviation < 0.12) {
                         status = 'slight_drift';
-                        score = 0.5;
+                        score = 0.3;
                     } else {
                         status = 'looking_away';
                         score = 0.0;
@@ -381,7 +381,7 @@ export const detectEyeContact = async (videoElement) => {
                 let isLookingForward = true;
                 if (faceWidth > 0) {
                     const deviationRatio = Math.abs(noseTipX - eyeMidX) / faceWidth;
-                    isLookingForward = deviationRatio < 0.30;
+                    isLookingForward = deviationRatio < 0.22; // Stricter (was 0.30)
                 }
 
                 return {

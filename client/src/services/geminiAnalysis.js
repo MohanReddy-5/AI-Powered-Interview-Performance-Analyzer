@@ -1,52 +1,20 @@
 /**
  * HYBRID ANALYSIS SERVICE
  * ========================
- * Local-First + Gemini Enhancement
+ * Local-First + Server-Side Gemini Enhancement
  * 
  * How it works:
  *   1. ALWAYS runs local concept-level scoring first (never crashes)
  *   2. If zero-score detected locally → returns 0 immediately (saves API quota)
- *   3. If Gemini API key available → calls Gemini for enhanced scoring
+ *   3. Calls server-side /api/gemini-analyze endpoint for enhanced scoring
+ *      (API key stays hidden on the server — never exposed to the browser)
  *   4. Blends local + Gemini scores (30% local, 70% Gemini when available)
- *   5. If Gemini fails → returns local score (still meaningful, never 0 for valid answers)
+ *   5. If server call fails → returns local score (still meaningful, never 0 for valid answers)
  * 
  * Output format is IDENTICAL to the old version — no UI changes needed.
  */
 
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import { scoreAnswerLocally, isZeroScoreAnswer } from './conceptMatcher.js';
-
-// Models to try in order (first available wins)
-const MODEL_CANDIDATES = [
-    'gemini-1.5-flash',
-    'gemini-1.5-pro',
-    'gemini-2.0-flash',
-];
-
-/**
- * Try Gemini content generation with model fallback
- */
-async function generateWithFallback(genAI, prompt, generationConfig = {}) {
-    let lastError;
-    for (const modelName of MODEL_CANDIDATES) {
-        try {
-            const model = genAI.getGenerativeModel({
-                model: modelName,
-                generationConfig: { responseMimeType: 'application/json', ...generationConfig }
-            });
-            const result = await model.generateContent(prompt);
-            return result.response.text();
-        } catch (err) {
-            const msg = err.message || '';
-            if (msg.includes('404') || msg.includes('not found') || msg.includes('NOT_FOUND')) {
-                lastError = err;
-                continue; // try next model
-            }
-            throw err; // non-404, propagate
-        }
-    }
-    throw lastError || new Error('All Gemini model candidates failed');
-}
 
 /**
  * Strip markdown code fences from LLM response
@@ -59,10 +27,12 @@ function stripFences(text) {
 }
 
 /**
- * MAIN ANALYSIS FUNCTION — Hybrid Local + Gemini
+ * MAIN ANALYSIS FUNCTION — Hybrid Local + Server-Side Gemini
  * 
  * This is the ONLY function called by Interview.jsx.
  * Its signature and return format are IDENTICAL to the old version.
+ * NOTE: apiKey parameter is NO LONGER NEEDED (server uses its own key)
+ *       but kept for backward compatibility — it is simply ignored.
  */
 export async function analyzeWithGemini(params) {
     const { transcript, question, ideal_answer, audio_blob, apiKey } = params;
@@ -72,32 +42,9 @@ export async function analyzeWithGemini(params) {
     // ══════════════════════════════════════════════════════════
     let finalTranscript = (transcript || '').trim();
 
-    // If no transcript but we have audio + API key, try to transcribe
-    if (!finalTranscript && audio_blob && apiKey && apiKey.length >= 20) {
-        try {
-            const genAI = new GoogleGenerativeAI(apiKey);
-            for (const modelName of ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash']) {
-                try {
-                    const model = genAI.getGenerativeModel({ model: modelName });
-                    const audioBase64 = await blobToBase64(audio_blob);
-                    const transcriptionResult = await model.generateContent([
-                        'Transcribe this audio. If no speech, return exactly: NO_SPEECH',
-                        { inlineData: { data: audioBase64.split(',')[1], mimeType: 'audio/webm' } }
-                    ]);
-                    const txt = transcriptionResult.response.text().trim();
-                    if (txt !== 'NO_SPEECH' && txt.length >= 5) {
-                        finalTranscript = txt;
-                    }
-                    break;
-                } catch (e) {
-                    if (e.message?.includes('404')) continue;
-                    break;
-                }
-            }
-        } catch (audioErr) {
-            console.warn('Audio transcription failed:', audioErr.message);
-        }
-    }
+    // Audio transcription via Gemini is no longer available client-side
+    // (API key is on the server now). If no transcript, proceed with empty.
+    // The server-side submit-answer endpoint handles audio transcription if needed.
 
     // ══════════════════════════════════════════════════════════
     // STEP 2: ALWAYS run local scoring first (this never fails)
@@ -106,122 +53,63 @@ export async function analyzeWithGemini(params) {
     const localResult = scoreAnswerLocally(finalTranscript, question, ideal_answer);
     console.log(`📊 Local score: ${localResult.score}/100 (method: ${localResult.scoring_method})`);
 
-    // If zero-score detected locally → return immediately (don't waste API)
-    if (localResult.score === 0) {
-        console.log('🚫 Zero-score answer detected locally — skipping API call');
+    // If zero-score detected locally → only skip API call for GENUINELY empty/short answers.
+    // Do NOT short-circuit if the answer is long enough that local detection may have fired
+    // a false positive (e.g. user said "I don't know the exact syntax but..." and kept going).
+    const wordCountForShortCircuit = finalTranscript.trim().split(/\s+/).length;
+    if (localResult.score === 0 && wordCountForShortCircuit <= 20) {
+        console.log('🚫 Zero-score answer detected locally (short/empty) — skipping API call');
         return localResult;
+    }
+    if (localResult.score === 0 && wordCountForShortCircuit > 20) {
+        console.log('⚠️ Local scored 0 but answer has', wordCountForShortCircuit, 'words — still calling Gemini to evaluate content');
+        // Continue to Gemini — the answer may have real content that local missed
     }
 
     // ══════════════════════════════════════════════════════════
-    // STEP 3: If no API key → return local score as-is
-    // ══════════════════════════════════════════════════════════
-    if (!apiKey || apiKey.length < 20) {
-        console.log('🔑 No API key — using local score only');
-        return localResult;
-    }
-
-    // ══════════════════════════════════════════════════════════
-    // STEP 4: Try Gemini enhancement (optional — improves accuracy)
+    // STEP 3: Call server-side Gemini proxy for enhanced scoring
     // ══════════════════════════════════════════════════════════
     try {
-        console.log('🤖 Calling Gemini for enhanced scoring...');
-        const genAI = new GoogleGenerativeAI(apiKey);
+        console.log('🤖 Calling server-side Gemini proxy for enhanced scoring...');
 
-        const prompt = `You are a PRECISE and FAIR interview evaluator. Score the answer ACCURATELY based on actual content quality. Do NOT inflate scores — differentiate clearly between weak, average, and strong answers.
+        // Get auth token for the API call
+        const token = localStorage.getItem('token') || localStorage.getItem('auth_token');
+        const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
-**QUESTION:** ${question}
+        const response = await fetch(`${API_BASE_URL}/api/gemini-analyze`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+            },
+            body: JSON.stringify({
+                transcript: finalTranscript,
+                question: question,
+                ideal_answer: ideal_answer || ''
+            })
+        });
 
-**CANDIDATE'S ANSWER:** ${finalTranscript}
+        if (!response.ok) {
+            throw new Error(`Server returned ${response.status}`);
+        }
 
-**IDEAL ANSWER (reference for evaluation):** ${ideal_answer || 'Not provided'}
+        const data = await response.json();
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STEP 1 — CHECK FOR NON-ANSWERS (mandatory, do this first):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-If the answer matches ANY of these → set ALL scores to 0 immediately:
-  • "I don't know", "I have no idea", "I can't answer", "skip", "pass", any refusal
-  • Empty response, just filler sounds ("um", "uh", "hmm"), or fewer than 3 real words
-  • Single words that don't demonstrate knowledge (e.g., "yes", "no", "maybe")
-  • Content COMPLETELY UNRELATED to the question (no topical connection at all)
-
-STEP 2 — SCORE ACCURATELY WITH DIFFERENTIATION:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-This is a SPOKEN exam. Be fair but not inflated.
-
-SCORING SCALE (use the FULL range, do NOT cluster scores):
-  0       → Non-answer, refusal, "I don't know", completely unrelated
-  5-15    → Completely off-topic or unrelated content
-  18-30   → Barely relevant, shows vague awareness but major confusion
-  32-45   → Shows some understanding but misses most key concepts
-  48-60   → Decent understanding, covers some key points but incomplete
-  62-75   → Good answer, covers most concepts with reasonable depth
-  78-88   → Strong answer, comprehensive with good technical accuracy
-  90-100  → Exceptional, covers all concepts with expert-level insight
-
-DIMENSION-SPECIFIC RULES:
-• technical: Score based on ACTUAL technical accuracy. Wrong facts = low score. Vague generalities = 30-45 max.
-• grammar: For spoken language, be lenient (60+ if understandable). Only penalize for truly unclear communication.
-• accent: Score clarity of expression and articulation (60+ if reasonably clear).
-• confidence: Score based on how structured and decisive the answer sounds.
-
-SPECIAL CASES:
-• BEHAVIORAL/SOFT SKILLS questions (teamwork, leadership, etc.): Any thoughtful personal answer = 55+. Genuine reflection = 70+.
-• SHORT BUT CORRECT: A brief correct answer can score 55-70. Brevity is fine if accurate.
-• PARAPHRASING: Informal explanations of concepts get FULL credit if the understanding is correct.
-
-⚠️ CRITICAL: Do NOT score every answer 55+. Use the FULL 0-100 range. A mediocre answer should get 35-50, not 55+.
-
-**DIMENSIONS (each 0-100):**
-- overall_score: Overall quality using the scale above
-- technical: Technical accuracy (be strict — wrong info = low scores)
-- grammar: Language quality (lenient for spoken, 60+ baseline if understandable)
-- accent: Clarity of expression
-- confidence: Decisiveness and structure
-
-**FEEDBACK:** 2-3 sentences. Start with what they got right, then specific gaps.
-
-Return ONLY valid JSON (no markdown, no code fences):
-{
-  "overall_score": <0-100>,
-  "technical": <0-100>,
-  "grammar": <0-100>,
-  "accent": <0-100>,
-  "confidence": <0-100>,
-  "feedback": "<2-3 specific sentences>",
-  "technical_feedback": "<1 sentence on technical accuracy>",
-  "grammar_feedback": "<1 sentence on communication>",
-  "missing_concepts": ["concept 1", "concept 2"],
-  "improvement_points": ["tip 1", "tip 2", "tip 3"],
-  "status": "<excellent|good|fair|poor>"
-}`;
-
-        let responseText;
-        try {
-            responseText = await generateWithFallback(genAI, prompt);
-        } catch (apiErr) {
-            console.warn('Gemini API error — using local score:', apiErr.message);
-            localResult.feedback += ' (AI enhancement unavailable — local analysis used)';
+        if (!data.success || !data.analysis) {
+            console.warn('Server Gemini proxy error:', data.error || 'Unknown error');
+            console.log('🔑 Using local score only (server proxy failed)');
             return localResult;
         }
 
-        // Parse JSON response
-        let geminiAnalysis;
-        try {
-            geminiAnalysis = JSON.parse(stripFences(responseText));
-        } catch (parseErr) {
-            const match = responseText.match(/\{[\s\S]*\}/);
-            if (match) {
-                try { geminiAnalysis = JSON.parse(match[0]); } catch { geminiAnalysis = null; }
-            }
-        }
+        const geminiAnalysis = data.analysis;
 
-        if (!geminiAnalysis || typeof geminiAnalysis.overall_score !== 'number') {
+        if (typeof geminiAnalysis.overall_score !== 'number') {
             console.warn('Gemini returned unparseable response — using local score');
             return localResult;
         }
 
         // ══════════════════════════════════════════════════════════
-        // STEP 5: BLEND LOCAL + GEMINI SCORES
+        // STEP 4: USE GEMINI SCORE DIRECTLY (no keyword blending)
         // ══════════════════════════════════════════════════════════
         let geminiScore = Math.max(0, Math.min(100, Math.round(geminiAnalysis.overall_score)));
 
@@ -233,19 +121,8 @@ Return ONLY valid JSON (no markdown, no code fences):
             geminiScore = 0;
         }
 
-        // BLEND: 30% local + 70% Gemini (Gemini is more nuanced when available)
-        const blendedScore = Math.round(localResult.score * 0.3 + geminiScore * 0.7);
-
-        // SANITY CHECK: If local and Gemini wildly disagree (>40 point gap),
-        // trust the lower score (defensive — prevents inflation)
-        const gap = Math.abs(localResult.score - geminiScore);
-        let finalScore;
-        if (gap > 40) {
-            finalScore = Math.min(localResult.score, geminiScore);
-            console.warn(`⚠️ Score disagreement (local=${localResult.score}, gemini=${geminiScore}) — using lower: ${finalScore}`);
-        } else {
-            finalScore = blendedScore;
-        }
+        // Use Gemini score directly — no keyword-based blending
+        let finalScore = geminiScore;
 
         const finalStatus = geminiAnalysis.status || (finalScore >= 80 ? 'excellent' : finalScore >= 60 ? 'good' : finalScore >= 40 ? 'fair' : 'poor');
 
@@ -255,7 +132,7 @@ Return ONLY valid JSON (no markdown, no code fences):
         const accentScore = Math.round(geminiAnalysis.accent || 0);
         const confScore = Math.round(geminiAnalysis.confidence || 0);
 
-        console.log(`✅ Hybrid score: ${finalScore} (local=${localResult.score}, gemini=${geminiScore}, blend=${blendedScore})`);
+        console.log(`✅ Score: ${finalScore} (from Gemini, local was ${localResult.score})`);
 
         return {
             score: finalScore,
@@ -285,9 +162,9 @@ Return ONLY valid JSON (no markdown, no code fences):
 
     } catch (error) {
         // ══════════════════════════════════════════════════════════
-        // STEP 6: Gemini failed entirely — return local score
+        // STEP 5: Server call failed — return local score
         // ══════════════════════════════════════════════════════════
-        console.error('Gemini analysis failed — using local score:', error.message);
+        console.error('Gemini server proxy failed — using local score:', error.message);
         const isQuotaError = error.message?.includes('429') || error.message?.includes('RESOURCE_EXHAUSTED');
         if (isQuotaError) {
             localResult.feedback += ' (AI quota exceeded — local analysis used)';

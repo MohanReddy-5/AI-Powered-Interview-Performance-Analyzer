@@ -60,13 +60,18 @@ class LLMEvaluator:
     """
 
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key
+        # Priority: explicit arg > environment variable
+        self.api_key = api_key or os.environ.get('GEMINI_API_KEY')
         self.max_retries = 2          # per individual call
         self.call_timeout = 25        # seconds per API call
         # Try these models in order — first available wins
+        # NOTE: gemini-2.5-flash-lite is listed first because 2.0-flash has
+        # a smaller free-tier daily quota that can be exhausted quickly.
         self.model_candidates = [
-            'models/gemini-2.0-flash',
+            'models/gemini-2.5-flash-lite',
+            'models/gemini-flash-lite-latest',
             'models/gemini-2.0-flash-lite',
+            'models/gemini-2.0-flash',
             'models/gemini-flash-latest',
         ]
 
@@ -106,11 +111,21 @@ class LLMEvaluator:
                 "answer_type": "non_answer"
             }
 
-        # Relaxed check: real Gemini keys are typically 39 chars (AIzaSy...)
+        # ── Run speech quality analysis (used by both LLM and fallback) ──
+        from utils.speech_analyzer import analyze_speech_quality
+        speech_metrics = analyze_speech_quality(user_answer)
+
+        # Final key check: try environment if still empty
         if not active_api_key or len(active_api_key) < 10:
-            # No API key — use concept-level fallback instead of error
-            logger.warning("No API key — using concept-level fallback scoring")
-            return self._create_fallback_response(user_answer, question, ideal_answer)
+            active_api_key = os.environ.get('GEMINI_API_KEY', '').strip()
+
+        if not active_api_key or len(active_api_key) < 10:
+            # No API key — return honest "AI unavailable" response
+            print("❌ LLM Evaluator: No valid API key found. Using fallback.")
+            logger.warning("No API key — AI scoring unavailable")
+            return self._create_fallback_response(user_answer, question, ideal_answer, speech_metrics)
+
+        print(f"🤖 LLM Evaluator: Starting analysis for question: '{question[:30]}...'")
 
         # Sanitize inputs to prevent JSON injection in prompt
         safe_question = self._sanitize_text(question)
@@ -135,7 +150,8 @@ class LLMEvaluator:
                     domain=safe_domain,
                     ideal_answer=safe_ideal,
                     answer_type=answer_type,
-                    api_key=active_api_key
+                    api_key=active_api_key,
+                    speech_metrics=speech_metrics
                 )
 
                 if self._validate_response(result):
@@ -160,17 +176,22 @@ class LLMEvaluator:
                 if '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
                     logger.warning(
                         "Rate limited (429) on attempt %d — using fallback.", attempt + 1)
+                    print(f"⚠️ LLM Evaluator: Rate limited (429).")
                     break
+                
                 logger.error(
                     "LLM evaluation error (attempt %d): %s", attempt + 1, e)
+                print(f"❌ LLM Evaluator error (attempt {attempt + 1}): {e}")
+                
                 if attempt < self.max_retries:
                     time.sleep(1.5 * (attempt + 1))
                     continue
 
-        # All retries exhausted — fall back to concept-level scoring
+        # All retries exhausted — return honest fallback
         logger.warning(
-            "All retries exhausted — using concept-level fallback scoring")
-        return self._create_fallback_response(user_answer, question, ideal_answer)
+            "All retries exhausted — AI scoring unavailable")
+        print("⚠️ LLM Evaluator: All retries exhausted. Using fallback.")
+        return self._create_fallback_response(user_answer, question, ideal_answer, speech_metrics)
 
     def _evaluate_with_timeout(
         self,
@@ -179,7 +200,8 @@ class LLMEvaluator:
         domain: str,
         ideal_answer: Optional[str],
         answer_type: str,
-        api_key: str
+        api_key: str,
+        speech_metrics: dict = None
     ) -> Dict:
         """Run LLM evaluation in a thread with a hard timeout."""
         result_holder = {}
@@ -194,7 +216,8 @@ class LLMEvaluator:
                     question=question,
                     user_answer=user_answer,
                     domain=domain,
-                    ideal_answer=ideal_answer
+                    ideal_answer=ideal_answer,
+                    speech_metrics=speech_metrics
                 )
                 # Try each model candidate in order
                 last_error = None
@@ -204,7 +227,7 @@ class LLMEvaluator:
                             model=model_name,
                             contents=prompt,
                             config=types.GenerateContentConfig(
-                                temperature=0.3,
+                                temperature=0.5,
                                 response_mime_type='application/json'
                             )
                         )
@@ -340,12 +363,13 @@ class LLMEvaluator:
         question: str,
         user_answer: str,
         domain: str,
-        ideal_answer: Optional[str]
+        ideal_answer: Optional[str],
+        speech_metrics: dict = None
     ) -> str:
-        """Builds the evaluation prompt for the LLM."""
+        """Builds the evaluation prompt for the LLM, including speech quality metrics."""
 
-        prompt = f"""You are a PRECISE and FAIR interview evaluator for {domain} positions.
-Score the answer ACCURATELY based on actual content quality. Do NOT inflate scores.
+        prompt = f"""You are a PRECISE and FAIR interview coach for {domain} positions.
+You evaluate BOTH the content of the answer AND the delivery quality (how they said it).
 
 **QUESTION:** {question}
 
@@ -354,6 +378,10 @@ Score the answer ACCURATELY based on actual content quality. Do NOT inflate scor
         if ideal_answer:
             prompt += f"\n**IDEAL ANSWER (reference for evaluation):** {ideal_answer}\n"
 
+        # Include speech quality metrics if available
+        if speech_metrics and speech_metrics.get('summary_for_llm'):
+            prompt += f"\n**SPEECH QUALITY ANALYSIS (measured from transcript):**\n{speech_metrics['summary_for_llm']}\n"
+
         prompt += """
 STEP 1 — CHECK FOR NON-ANSWERS (do this first, mandatory):
 These MUST get ALL scores = 0 immediately:
@@ -361,26 +389,55 @@ These MUST get ALL scores = 0 immediately:
   • Empty, pure noise ("um", "uh"), fewer than 3 real words
   • Completely off-topic/unrelated content (score 0 for all)
 
-STEP 2 — SCORE ACCURATELY (use the FULL range):
-This is a SPOKEN interview. Be fair but precise.
-  • Barely relevant, major confusion → score 2-3/10
-  • Shows some understanding but misses most concepts → score 3-4/10
-  • Decent answer, covers some key points → score 5-6/10
-  • Good answer, covers most concepts well → score 6-7/10
-  • Strong, comprehensive answer → score 8-9/10
-  • Exceptional, expert-level → score 9-10/10
+STEP 2 — SCORE ACCURATELY (calibrated scale, use the FULL range):
+This is a SPOKEN interview. Be accurate, fair, and generous for genuine understanding.
+  • Barely relevant, major confusion → score 1-2/10
+  • Shows vague awareness but misses most concepts → score 3-4/10
+  • Partial understanding, covers a few key points → score 5-6/10
+  • Good answer, covers most concepts correctly → score 7-8/10
+  • Strong and comprehensive, solid technical accuracy → score 8-9/10
+  • Exceptional, expert-level depth with examples → score 9-10/10
 
 SPECIAL CASES:
-  • BEHAVIORAL questions (teamwork, leadership, etc.): Thoughtful personal answers = 6+. Genuine reflection = 7+.
-  • SHORT BUT CORRECT: Brief correct answers can score 5-7. Brevity is fine if accurate.
-  • PARAPHRASING: Informal correct explanations get full credit.
+  • BEHAVIORAL questions (teamwork, leadership, etc.): Thoughtful personal answers = 7+. Genuine reflection with specific examples = 8+.
+  • SHORT BUT CORRECT: A brief but accurate answer can score 6-8. Conciseness is not penalized if the understanding is clear.
+  • PARAPHRASING: Informal correct explanations get FULL credit. Understanding matters more than exact terminology.
+  • CONCEPTS EXPLAINED DIFFERENTLY: If the candidate demonstrates correct understanding with their own words, score it the same as a textbook answer.
 
-⚠️ CRITICAL: Use the FULL 0-10 range. A mediocre answer should get 3-5, not 6+. Do NOT inflate every answer.
+⚠️ CALIBRATION: A mediocre answer = 3-5. A correct but incomplete answer = 6-7. A correct and well-explained answer = 7-9. Do NOT deflate scores for correct answers.
+
+STEP 3 — GENERATE RESPONSE-SPECIFIC FEEDBACK (CRITICAL — vary style every time):
+
+⚠️ ABSOLUTE RULE: Your feedback MUST cover BOTH content accuracy AND delivery quality.
+
+**FEEDBACK VARIETY — CRITICAL:**
+You MUST vary how you open and structure your feedback each time. Pick a DIFFERENT opener from this list for each response:
+  Option A: "[Candidate's specific point] — you correctly explained [X], though [delivery/content gap]."
+  Option B: "Your understanding of [concept] came through clearly. [Delivery observation based on speech analysis]."
+  Option C: "The strongest part of your answer was [specific point]. To sharpen it, [specific improvement needed]."
+  Option D: "You demonstrated [concept] well by [specific paraphrase of their words]. [One honest delivery critique]."
+  Option E: "Solid grasp of [topic] — you covered [key point]. [Speech-quality observation from analysis data]."
+  Option F: "[Direct observation about what they said first], which shows [assessment]. [Delivery note]."
+NEVER start two answers with the same opener. Quote or paraphrase what the candidate ACTUALLY SAID — make it feel personal, not generic.
+
+**FEEDBACK rules (content + delivery):**
+- First, evaluate WHAT they said: concepts they got right, concepts they missed
+- Second, evaluate HOW they said it: filler words, hedging, structure, confidence — reference SPEECH QUALITY ANALYSIS data
+- MUST be unique to THIS answer — never write generic advice like "study more" or "mention keyword X"
+- If the candidate explained the concept correctly but used different words than the ideal answer, give them FULL credit
+
+**IMPROVEMENT_POINTS rules (3 specific, actionable coaching tips):**
+- Mix CONTENT tips and DELIVERY tips (not all content or all delivery)
+- Content tips: name the exact concept they missed or misexplained, and what the correct explanation is
+- Delivery tips: call out a specific habit from the speech analysis (e.g., "You said 'I think' 3 times — replace with confident assertions")
+- Action-oriented: tell them WHAT TO DO, not just what was wrong
+- BAD: ["Study the topic more", "Include 'polymorphism' in your answer"]
+- GOOD: ["You said 'I think' twice — state facts confidently: replace 'I think closures...' with 'Closures work by...'", "Add a concrete example: describe a counter function to make the concept tangible", "Structure: define the term → explain how it works → give a real-world use case"]
 
 **OUTPUT — ONLY this JSON, no markdown:**
-{"knowledge": <0-10>, "relevance": <0-10>, "clarity": <0-10>, "confidence": <0-10>, "feedback": "<2-3 specific sentences, start with what they got right>", "improvement_points": ["tip 1", "tip 2", "tip 3"], "ideal_answer": "<expert model answer in 2-4 sentences>"}
+{"knowledge": <0-10>, "relevance": <0-10>, "clarity": <0-10>, "confidence": <0-10>, "feedback": "<2-3 sentences with a VARIED opener, covering content accuracy AND delivery quality, referencing what the candidate actually said>", "improvement_points": ["<specific, actionable content or delivery tip for THIS answer>", "<another specific tip with what to say/do>", "<another specific tip>"], "ideal_answer": "<expert model answer in 2-4 sentences>"}
 
-REMINDER: Non-answers = all 0. Use the FULL score range for genuine attempts. Do NOT cluster everything at 6+.
+REMINDER: Non-answers = all 0. Correct answers = 7-10. Use varied feedback openers every time.
 """
         return prompt
 
@@ -455,15 +512,33 @@ REMINDER: Non-answers = all 0. Use the FULL score range for genuine attempts. Do
             return 'empty'
 
         lower = text.lower().strip()
+        words = lower.split()
+        word_count = len(words)
 
         # Layer 1: Explicit refusal phrases
-        for phrase in self._REFUSAL_PHRASES:
-            if phrase in lower:
-                return 'refusal'
+        # CRITICAL FIX: Word-count guard — only flag short answers (≤20 words) as refusal.
+        # Long answers may mention uncertainty briefly before providing a real explanation
+        # (e.g. "I don't know the exact syntax but closures work by...").
+        # In those cases, let Gemini evaluate the actual content.
+        if word_count <= 20:
+            for phrase in self._REFUSAL_PHRASES:
+                if phrase in lower:
+                    return 'refusal'
+        else:
+            # Long answer: only flag as refusal if very little content remains
+            # after removing the refusal phrase
+            for phrase in self._REFUSAL_PHRASES:
+                if phrase in lower:
+                    without_refusal = lower.replace(phrase, '').strip()
+                    remaining_words = [w for w in without_refusal.split() if len(w) > 2]
+                    if len(remaining_words) < 8:
+                        # Mostly a refusal + very little real content
+                        return 'refusal'
+                    # Otherwise: user caveated but then explained — not a non-answer
+                    break
 
-        # Layer 2: Regex-based refusal intent (short answers only)
-        words = lower.split()
-        if len(words) <= 15:
+        # Layer 2: Regex-based refusal intent (short answers only — ≤20 words)
+        if word_count <= 20:
             for pattern in self._REFUSAL_PATTERNS:
                 if pattern.search(lower):
                     return 'refusal_intent'
@@ -496,18 +571,17 @@ REMINDER: Non-answers = all 0. Use the FULL score range for genuine attempts. Do
         }
         return messages.get(reason, 'No meaningful answer detected.')
 
-    # ── CONCEPT-LEVEL FALLBACK SCORING ─────────────────────────────────────
+    # ── FALLBACK WHEN AI IS UNAVAILABLE ─────────────────────────────────────
 
     def _create_fallback_response(
-        self, user_answer: str, question: str, ideal_answer: str = None
+        self, user_answer: str, question: str, ideal_answer: str = None,
+        speech_metrics: dict = None
     ) -> Dict:
         """
-        Concept-level fallback when LLM is unavailable.
-        Uses TF-IDF cosine similarity + keyword overlap instead of word-count.
+        Honest fallback when LLM is unavailable.
+        Instead of fake keyword-based scores, gives delivery-based feedback
+        from speech metrics and acknowledges AI scoring is unavailable.
         """
-        import math
-        from collections import Counter
-
         cleaned = user_answer.strip() if user_answer else ""
         words = cleaned.lower().split()
 
@@ -522,124 +596,112 @@ REMINDER: Non-answers = all 0. Use the FULL score range for genuine attempts. Do
                 "answer_type": "empty"
             }
 
-        # Filter to meaningful words
-        meaningful = [
-            w for w in words if w not in self._FILLER_WORDS and len(w) > 1]
-        meaningful_count = len(meaningful)
+        # Build delivery-based feedback from speech metrics
+        feedback_parts = []
+        improvement_tips = []
 
-        # Very short with no technical terms = too brief
-        tech_pattern = re.compile(
-            r'\b(api|rest|http|sql|nosql|orm|mvc|oop|async|await|promise|'
-            r'callback|closure|recursion|array|stack|queue|tree|graph|'
-            r'hash|cache|thread|process|class|object|function|variable|'
-            r'database|server|client|frontend|backend|algorithm|'
-            r'boolean|string|null|undefined|json|html|css|'
-            r'react|angular|vue|node|python|java|typescript|javascript|'
-            r'docker|kubernetes|git|component|state|props|hook|'
-            r'schema|index|query|deploy|module|interface|pattern|'
-            r'protocol|framework|library|package|scope|prototype|'
-            r'inheritance|polymorphism|encapsulation|abstraction)\b',
-            re.IGNORECASE
-        )
-        has_tech = bool(tech_pattern.search(cleaned))
-
-        if meaningful_count < 2 and not has_tech:
-            return {
-                "score": 0,
-                "feedback": "No meaningful answer provided. Please give a complete answer.",
-                "status": "poor",
-                "breakdown": {"knowledge": 0, "relevance": 0, "clarity": 0, "confidence": 0,
-                              "technical": 0, "grammar": 0, "accent": 0,
-                              "technical_score": 0, "communication_score": 0,
-                              "depth_score": 0, "confidence_score": 0},
-                "improvement_points": ["Provide a complete answer.", "Explain in your own words."],
-                "answer_type": "too_brief"
-            }
-
-        # ── TF-IDF COSINE SIMILARITY (when ideal_answer is available) ──
-        score = 0
-        feedback = ""
-
-        if ideal_answer and len(ideal_answer.strip()) > 10:
-            cosine_sim = self._compute_cosine_similarity(
-                cleaned.lower(), ideal_answer.lower()
-            )
-            keyword_score = self._compute_keyword_overlap(
-                cleaned.lower(), question.lower(), ideal_answer.lower()
-            )
-
-            # Weighted blend
-            raw = cosine_sim * 0.5 + keyword_score * \
-                0.3 + min(meaningful_count / 30, 1.0) * 0.2
-
-            # Calibrate to 0-100
-            if raw <= 0.05:
-                score = int(raw * 200)  # 0-10
-            elif raw <= 0.15:
-                score = 10 + int((raw - 0.05) * 200)  # 10-30
-            elif raw <= 0.30:
-                score = 30 + int((raw - 0.15) * 200)  # 30-60
-            elif raw <= 0.50:
-                score = 60 + int((raw - 0.30) * 150)  # 60-90
-            else:
-                score = 90 + int((raw - 0.50) * 20)   # 90-100
-
-            score = max(0, min(100, score))
-
-            # Extra boost for technical terms
-            if has_tech:
-                score = min(100, score + 8)
-
-            # Zero gate: if cosine < 0.1 AND no keyword overlap → unrelated
-            if cosine_sim < 0.1 and keyword_score < 0.05 and not has_tech:
-                score = 0
-                feedback = "Your answer does not appear to be related to the question."
-            elif score >= 75:
-                feedback = "Strong answer with good concept coverage."
-            elif score >= 50:
-                feedback = "Decent answer covering some key concepts. Add more depth."
-            elif score >= 25:
-                feedback = "Answer shows some awareness but misses major concepts."
-            else:
-                feedback = "Answer is weak. Review the ideal answer for key concepts."
-
-        else:
-            # No ideal answer — basic quality assessment
-            if meaningful_count < 5:
-                score = 25 if has_tech else 15
-            elif meaningful_count < 15:
-                score = 45 if has_tech else 35
-            elif meaningful_count < 30:
-                score = 60 if has_tech else 50
-            else:
-                score = 70 if has_tech else 60
-            feedback = "Answer recorded. Scoring is approximate without an ideal answer reference."
-
-        status = (
-            "excellent" if score >= 80 else
-            "good" if score >= 60 else
-            "fair" if score >= 40 else
-            "poor"
+        feedback_parts.append(
+            "AI-powered content scoring is temporarily unavailable. "
+            "Your answer was recorded. Here is delivery feedback based on your speech patterns:"
         )
 
-        rb = max(0, min(10, int(score / 10)))
+        if speech_metrics:
+            fillers = speech_metrics.get('filler_analysis', {})
+            hedging = speech_metrics.get('hedging_analysis', {})
+            structure = speech_metrics.get('structure_analysis', {})
+            examples = speech_metrics.get('example_usage', {})
+            repetition = speech_metrics.get('repetition_analysis', {})
+
+            # Filler word feedback
+            if fillers.get('count', 0) > 2:
+                filler_list = ', '.join(
+                    f'"{k}"' for k in list(fillers.get('details', {}).keys())[:3]
+                )
+                feedback_parts.append(
+                    f"You used {fillers['count']} filler words ({filler_list}). "
+                    "Try replacing these with confident pauses."
+                )
+                improvement_tips.append(
+                    f"Reduce filler words — you used {filler_list}. "
+                    "Practice pausing silently instead of saying 'um' or 'basically'."
+                )
+            elif fillers.get('count', 0) == 0:
+                feedback_parts.append("Clean delivery with no filler words.")
+
+            # Hedging feedback
+            if hedging.get('count', 0) > 0:
+                hedge_list = ', '.join(
+                    f'"{p}"' for p in hedging.get('phrases_found', [])[:3]
+                )
+                feedback_parts.append(
+                    f"You used hedging language ({hedge_list}). "
+                    "State your knowledge as facts, not guesses."
+                )
+                improvement_tips.append(
+                    f"Remove uncertainty phrases like {hedge_list}. "
+                    "Say 'X works by...' instead of 'I think X might work by...'"
+                )
+
+            # Structure feedback
+            if structure.get('issue'):
+                issue = structure['issue']
+                if issue == 'single_run_on_sentence':
+                    feedback_parts.append(
+                        "Your answer was one long run-on sentence. "
+                        "Break it into clear points."
+                    )
+                    improvement_tips.append(
+                        "Structure your answer: define the concept, explain how it works, give an example."
+                    )
+                elif issue == 'very_choppy':
+                    feedback_parts.append(
+                        "Your answer had many very short sentences. "
+                        "Try connecting ideas with transitions."
+                    )
+
+            # Example usage feedback
+            if not examples.get('used_examples', False):
+                improvement_tips.append(
+                    "Add a concrete example or real-world scenario to make your answer memorable."
+                )
+
+            # Repetition feedback
+            overused = repetition.get('overused_words', {})
+            if overused:
+                rep_list = ', '.join(
+                    f'"{k}" ({v}x)' for k, v in list(overused.items())[:3]
+                )
+                improvement_tips.append(
+                    f"You repeated: {rep_list}. Vary your language for a more polished delivery."
+                )
+
+        # Ensure we have at least some improvement tips
+        if not improvement_tips:
+            improvement_tips = [
+                "Review the ideal answer and compare it with what you said.",
+                "Practice structuring answers: concept → explanation → example.",
+                "Try to sound confident — avoid hedging phrases like 'I think' or 'maybe'."
+            ]
+
+        feedback = ' '.join(feedback_parts)
+
+        # Give a moderate default score since we can't properly evaluate content
+        # This is honest — we acknowledge we can't score accurately
+        score = 50
+        status = "fair"
+
         return {
             "score": score,
-            "feedback": feedback + " (Note: AI scoring unavailable — concept-level analysis used.)",
+            "feedback": feedback,
             "status": status,
             "breakdown": {
-                "knowledge": rb, "relevance": rb, "clarity": rb, "confidence": rb,
-                "technical": score, "grammar": min(100, score + 10),
-                "accent": score, "confidence_score": score,
-                "technical_score": score, "communication_score": min(100, score + 10),
-                "depth_score": score
+                "knowledge": 5, "relevance": 5, "clarity": 5, "confidence": 5,
+                "technical": 50, "grammar": 50, "accent": 50, "confidence_score": 50,
+                "technical_score": 50, "communication_score": 50,
+                "depth_score": 50
             },
-            "improvement_points": [
-                "AI analysis unavailable — concept-level scoring applied.",
-                "Focus on covering the key technical concepts in your answer.",
-                "Review the ideal answer for concepts you may have missed."
-            ],
-            "answer_type": "fallback_concept"
+            "improvement_points": improvement_tips[:4],
+            "answer_type": "ai_unavailable"
         }
 
     def _compute_cosine_similarity(self, text1: str, text2: str) -> float:

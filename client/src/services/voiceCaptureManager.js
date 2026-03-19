@@ -37,7 +37,7 @@ class VoiceCaptureManager {
         this.recognition.continuous = true;
         this.recognition.interimResults = true;
         this.recognition.lang = 'en-US';
-        this.recognition.maxAlternatives = 3;
+        this.recognition.maxAlternatives = 5; // Up from 3 — more candidates = better accuracy
 
         this.recognition.onstart = () => {
             console.log('🎤 Speech recognition started');
@@ -54,11 +54,26 @@ class VoiceCaptureManager {
             let final = '';
 
             for (let i = event.resultIndex; i < event.results.length; i++) {
-                const transcript = event.results[i][0].transcript;
+                // Pick the best alternative using cleanTranscript quality heuristic
+                let bestTranscript = event.results[i][0].transcript;
+                let bestScore = 0;
+                const numAlts = event.results[i].length;
+                for (let a = 0; a < numAlts; a++) {
+                    const altText = event.results[i][a].transcript;
+                    const cleaned = this.cleanTranscript(altText);
+                    // Prefer alternatives that produce the most corrected technical terms
+                    const techScore = (cleaned.match(/[A-Z][a-z]+[A-Z]|[A-Z]{2,}|\b(useState|useEffect|useRef|useCallback|useMemo|useContext|TypeScript|JavaScript|ReactJS|GraphQL|NoSQL|REST|API|JWT|OAuth|CRUD|SQL|CSS|HTML)\b/g) || []).length;
+                    const confScore = event.results[i][a].confidence || 0;
+                    const combined = techScore * 2 + confScore;
+                    if (combined > bestScore) {
+                        bestScore = combined;
+                        bestTranscript = altText;
+                    }
+                }
                 if (event.results[i].isFinal) {
-                    final += this.cleanTranscript(transcript) + ' ';
+                    final += this.cleanTranscript(bestTranscript) + ' ';
                 } else {
-                    interim += transcript;
+                    interim += bestTranscript;
                 }
             }
 
@@ -332,27 +347,201 @@ class VoiceCaptureManager {
 
         let cleaned = text;
 
-        // Common speech-to-text corrections for technical terms
+        // ── Common speech-to-text corrections for technical terms ──────────────
+        // Each entry maps common misrecognitions to the correct technical term.
+        // Keys are lowercase patterns; match is case-insensitive via regex.
         const corrections = {
+            // Frameworks & Runtimes
             'react jay ess': 'ReactJS',
             'react js': 'ReactJS',
+            'react.js': 'ReactJS',
+            'reactor': 'ReactJS',
             'java script': 'JavaScript',
+            'java scripts': 'JavaScript',
             'type script': 'TypeScript',
+            'typescript errors': 'TypeScript errors',
             'no js': 'Node.js',
             'node jay ess': 'Node.js',
+            'node.js': 'Node.js',
+            'next js': 'Next.js',
+            'next jay ess': 'Next.js',
+            'vue js': 'Vue.js',
+            'angular js': 'AngularJS',
             'pie thon': 'Python',
-            'my sequel': 'MySQL',
-            'mongo db': 'MongoDB',
+
+            // React Hooks (frequently misrecognized)
+            'use state': 'useState',
+            'use effect': 'useEffect',
+            'use ref': 'useRef',
+            'use memo': 'useMemo',
+            'use callback': 'useCallback',
+            'use context': 'useContext',
+            'use reducer': 'useReducer',
+            'use layout effect': 'useLayoutEffect',
+            'use imperative handle': 'useImperativeHandle',
+            'use debug value': 'useDebugValue',
+            'use transition': 'useTransition',
+            'use deferred value': 'useDeferredValue',
+            'use id': 'useId',
+
+            // CSS
+            'flex box': 'flexbox',
+            'flex-box': 'flexbox',
+            'grid layout': 'CSS Grid',
+            'css grid': 'CSS Grid',
+            'media query': 'media query',
+            'media queries': 'media queries',
+            'pseudo class': 'pseudo-class',
+            'pseudo element': 'pseudo-element',
+            'z index': 'z-index',
+            'z-index': 'z-index',
+            'border radius': 'border-radius',
+            'box shadow': 'box-shadow',
+
+            // JavaScript concepts
+            'call back': 'callback',
+            'call backs': 'callbacks',
+            'proto type': 'prototype',
+            'proto types': 'prototypes',
+            'clo sure': 'closure',
+            'clo sures': 'closures',
+            'ho isting': 'hoisting',
+            'sync ronous': 'synchronous',
+            'a sink': 'async',
+            'a sync': 'async',
+            'a synchronous': 'asynchronous',
+            'proms': 'promises',
+            'prom is': 'promise',
+            'prom ise': 'promise',
+            'event loop': 'event loop',
+            'spread operator': 'spread operator',
+            'destructor ring': 'destructuring',
+            'destructure': 'destructuring',
+            'generator functions': 'generator functions',
+            'arrow functions': 'arrow functions',
+            'temporal dead zone': 'Temporal Dead Zone',
+
+            // APIs and protocols
             'a p i': 'API',
             'a p is': 'APIs',
             'rest api': 'REST API',
+            'restful': 'RESTful',
+            'graph q l': 'GraphQL',
+            'graph ql': 'GraphQL',
+            'web socket': 'WebSocket',
+            'web sockets': 'WebSockets',
             'jason': 'JSON',
             'j son': 'JSON',
+            'j s o n': 'JSON',
+
+            // Databases
+            'my sequel': 'MySQL',
             'my sql': 'MySQL',
+            'mongo db': 'MongoDB',
+            'mongo d b': 'MongoDB',
+            'post gres': 'PostgreSQL',
+            'post greSQL': 'PostgreSQL',
+            'postgres ql': 'PostgreSQL',
+            'sequel ite': 'SQLite',
+            'redis cache': 'Redis cache',
+            'no sequel': 'NoSQL',
+            'no sql': 'NoSQL',
+
+            // DevOps & Tools
+            'data base': 'database',
+            'web pack': 'webpack',
+            'dock er': 'Docker',
+            'kubernetes': 'Kubernetes',
+            'kube': 'Kubernetes',
+            'get hub': 'GitHub',
+            'git hub': 'GitHub',
+            'ci cd': 'CI/CD',
+            'c i c d': 'CI/CD',
+            'continuous integration': 'continuous integration',
+
+            // React terms
+            'virtual d o m': 'Virtual DOM',
+            'virtual dom': 'Virtual DOM',
+            'virtual document object model': 'Virtual DOM',
+            'higher order component': 'Higher-Order Component',
+            'higher order components': 'Higher-Order Components',
+            'render prop': 'render prop',
+            'lazy loading': 'lazy loading',
+            'code splitting': 'code splitting',
+            'server side rendering': 'Server-Side Rendering',
+            'client side rendering': 'Client-Side Rendering',
+            'single page application': 'Single Page Application',
+            'single page app': 'Single Page Application',
+
+            // OOP concepts (commonly mispronounced)
+            'encapsulate': 'encapsulation',
+            'poly morphism': 'polymorphism',
+            'poly morphic': 'polymorphic',
+            'it ration': 'iteration',
+            'inherit ance': 'inheritance',
+            'ab straction': 'abstraction',
+            'abstract ion': 'abstraction',
+            'design pattern': 'design pattern',
+            'singleton': 'singleton',
+            'factory pattern': 'factory pattern',
+            'observer pattern': 'observer pattern',
+
+            // Security terms
+            'jay w t': 'JWT',
+            'j w t': 'JWT',
+            'jason web token': 'JSON Web Token',
+            'o auth': 'OAuth',
+            'oauth2': 'OAuth2',
+            'o auth two': 'OAuth2',
+            'https': 'HTTPS',
+            'x s s': 'XSS',
+            'cross site scripting': 'Cross-Site Scripting (XSS)',
+            'c s r f': 'CSRF',
+            'cee s r f': 'CSRF',
+            'sql injection': 'SQL injection',
+            'b crypt': 'bcrypt',
+            'bee crypt': 'bcrypt',
+            'salting': 'password salting',
+            'hashing': 'hashing',
+
+            // Testing
+            'chai': 'Chai',
+            'jest js': 'Jest',
+            'mock function': 'mock function',
+            'spy function': 'spy function',
+            'test driven': 'Test-Driven Development (TDD)',
+            'behavior driven': 'Behavior-Driven Development (BDD)',
+            'end to end': 'end-to-end',
+            'e to e': 'E2E',
+            't d d': 'TDD',
+            'b d d': 'BDD',
+
+            // System Design & Cloud
+            'load balancer': 'load balancer',
+            'a w s': 'AWS',
+            'amazon web services': 'AWS',
+            'g c p': 'GCP',
+            'google cloud': 'Google Cloud',
+            'azure': 'Azure',
+            'micro services': 'microservices',
+            'micro service': 'microservice',
+            'service mesh': 'service mesh',
+            'api gateway': 'API gateway',
+            'cap theorem': 'CAP theorem',
+            'rate limiting': 'rate limiting',
+            'circuit breaker': 'circuit breaker',
+            'content delivery network': 'CDN',
+            'c d n': 'CDN',
+            'k eight s': 'Kubernetes',
+            'k8s': 'Kubernetes',
+            'terra form': 'Terraform',
+            'ansible': 'Ansible',
+            'helm': 'Helm',
         };
 
+        // Apply corrections — case-insensitive, word-boundary aware
         Object.keys(corrections).forEach(wrong => {
-            const regex = new RegExp(wrong, 'gi');
+            const regex = new RegExp(`\\b${wrong.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi');
             cleaned = cleaned.replace(regex, corrections[wrong]);
         });
 

@@ -411,57 +411,71 @@ export const domains = [
     }
 ];
 
+// Shuffle helper
+const _shuffle = (arr) => {
+    const a = [...arr];
+    for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+};
+
 // Helper to get random questions with smart selection (avoids repeats across sessions)
+// Guarantees: questions in session N are NEVER the same as questions in session N-1
 export const getRandomQuestions = (domainId, count = 5) => {
     const domain = domains.find(d => d.id === domainId) || domains[0];
     const allQuestions = [...domain.questions];
 
-    // Track previously asked questions per domain in localStorage
-    const storageKey = `asked_questions_${domainId}`;
+    // Key 1: Full history of all asked questions (rolling, up to full pool size)
+    const historyKey = `asked_questions_${domainId}`;
+    // Key 2: The LAST session's questions — always excluded from the next session
+    const lastSessionKey = `last_session_${domainId}`;
+
     let askedTexts = [];
+    let lastSessionTexts = [];
     try {
-        askedTexts = JSON.parse(localStorage.getItem(storageKey) || '[]');
-    } catch { askedTexts = []; }
-
-    // Split questions into "not yet asked" and "already asked"
-    const unasked = allQuestions.filter(q => !askedTexts.includes(q.text));
-    const asked = allQuestions.filter(q => askedTexts.includes(q.text));
-
-    // If we've asked all questions, reset the memory
-    if (unasked.length === 0) {
-        localStorage.removeItem(storageKey);
-        // Treat all as unasked after reset
-        return getRandomQuestions(domainId, count); // recurse once with clean slate
+        askedTexts = JSON.parse(localStorage.getItem(historyKey) || '[]');
+        lastSessionTexts = JSON.parse(localStorage.getItem(lastSessionKey) || '[]');
+    } catch {
+        askedTexts = [];
+        lastSessionTexts = [];
     }
 
-    // Prioritize unasked questions, then fill with asked if needed
-    const shuffle = (arr) => {
-        for (let i = arr.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [arr[i], arr[j]] = [arr[j], arr[i]];
-        }
-        return arr;
-    };
+    // Build the candidate pool: prefer questions NOT in the last session
+    const notInLastSession = allQuestions.filter(q => !lastSessionTexts.includes(q.text));
 
-    shuffle(unasked);
-    shuffle(asked);
+    // If excluding last session leaves enough candidates, use that pool; otherwise use all
+    const candidatePool = notInLastSession.length >= count ? notInLastSession : allQuestions;
 
-    // Take from unasked first, then from asked to fill remaining
-    const selected = [...unasked.slice(0, count)];
+    // Within candidate pool: prioritise questions not yet seen in ANY prior session
+    const freshUnasked = _shuffle(candidatePool.filter(q => !askedTexts.includes(q.text)));
+    const seenBefore   = _shuffle(candidatePool.filter(q =>  askedTexts.includes(q.text)));
+
+    // If all candidates have been seen, reset history for candidate pool and try again
+    if (freshUnasked.length === 0 && seenBefore.length === 0) {
+        localStorage.removeItem(historyKey);
+        localStorage.removeItem(lastSessionKey);
+        return getRandomQuestions(domainId, count);
+    }
+
+    // Pick: fresh questions first, fill with previously-seen if needed
+    const selected = [...freshUnasked.slice(0, count)];
     if (selected.length < count) {
-        selected.push(...asked.slice(0, count - selected.length));
+        selected.push(...seenBefore.slice(0, count - selected.length));
     }
 
-    // Shuffle the final selection so order isn't predictable
-    shuffle(selected);
+    // Final shuffle so question order is also unpredictable
+    const finalSelected = _shuffle(selected).slice(0, count);
+    const selectedTexts = finalSelected.map(q => q.text);
 
-    // Save selected question texts to localStorage for future avoidance
-    const newAskedTexts = [...askedTexts, ...selected.map(q => q.text)];
-    // Keep only the last 3 sessions worth of questions to avoid bloating
-    const maxTracked = allQuestions.length; // track up to the full question pool
+    // Save: update rolling history + save this session so next session can exclude it
+    const newAskedTexts = [...askedTexts, ...selectedTexts];
+    const maxTracked = allQuestions.length;
     try {
-        localStorage.setItem(storageKey, JSON.stringify(newAskedTexts.slice(-maxTracked)));
+        localStorage.setItem(historyKey, JSON.stringify(newAskedTexts.slice(-maxTracked)));
+        localStorage.setItem(lastSessionKey, JSON.stringify(selectedTexts));
     } catch { /* localStorage full, ignore */ }
 
-    return selected.slice(0, count);
+    return finalSelected;
 };

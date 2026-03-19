@@ -110,16 +110,18 @@ export const analyzeIntent = (userAnswer, question) => {
                 /\b(fast|slow|speed|performance|efficient|optimize)/i,
                 /\b(quick|rapid|delay|lag|responsive)/i,
                 /\b(reduce|minimize|improve|enhance)/i,
-                /\b(bottleneck|overhead|cost)/i
+                /\b(bottleneck|overhead|cost|latency|throughput)/i,
+                /\b(cache|memoize|lazy|defer|preload)/i
             ],
             weight: 1.0
         },
         data_management: {
             patterns: [
                 /\b(store|save|keep|persist|cache)/i,
-                /\b(data|information|values?|state)/i,
-                /\b(retrieve|fetch|get|load)/i,
-                /\b(database|storage|memory)/i
+                /\b(data|information|values?|state|database|db)/i,
+                /\b(retrieve|fetch|get|load|query)/i,
+                /\b(nosql|sql|mongodb|redis|postgres)/i,
+                /\b(index|transaction|schema|relation)/i
             ],
             weight: 1.0
         },
@@ -128,16 +130,18 @@ export const analyzeIntent = (userAnswer, question) => {
                 /\b(compare|check|verify|validate)/i,
                 /\b(update|change|modify|alter|transform)/i,
                 /\b(create|generate|build|construct)/i,
-                /\b(delete|remove|destroy|clean)/i
+                /\b(delete|remove|destroy|clean)/i,
+                /\b(pipeline|workflow|sequence|step)/i
             ],
             weight: 1.0
         },
         architecture: {
             patterns: [
                 /\b(structure|organize|design|pattern|architecture)/i,
-                /\b(component|module|layer|tier)/i,
-                /\b(separate|decouple|isolate)/i,
-                /\b(system|framework|library)/i
+                /\b(component|module|layer|tier|service)/i,
+                /\b(separate|decouple|isolate|abstract)/i,
+                /\b(system|framework|library|microservice)/i,
+                /\b(monolith|soa|event.driven|hexagonal)/i
             ],
             weight: 1.0
         },
@@ -146,25 +150,28 @@ export const analyzeIntent = (userAnswer, question) => {
                 /\b(async|asynchronous|await|promise)/i,
                 /\b(callback|then|catch|finally)/i,
                 /\b(non-blocking|concurrent|parallel)/i,
-                /\b(background|queue|event)/i
+                /\b(background|queue|event|observable)/i,
+                /\b(websocket|streaming|polling|webhook)/i
             ],
             weight: 1.0
         },
         state_management: {
             patterns: [
-                /\b(state|props|context)/i,
+                /\b(state|props|context|store)/i,
                 /\b(immutable|mutable|readonly)/i,
-                /\b(update|set|get|change)/i,
-                /\b(redux|mobx|zustand)/i
+                /\b(update|set|get|change|dispatch)/i,
+                /\b(redux|mobx|zustand|recoil|vuex)/i,
+                /\b(reducer|action|selector|atom)/i
             ],
             weight: 1.0
         },
         dom_manipulation: {
             patterns: [
-                /\b(dom|element|node|tree)/i,
-                /\b(render|paint|reflow|repaint)/i,
-                /\b(browser|document|window)/i,
-                /\b(virtual|real|actual)/i
+                /\b(dom|element|node|tree|virtual dom)/i,
+                /\b(render|paint|reflow|repaint|reconcile)/i,
+                /\b(browser|document|window|viewport)/i,
+                /\b(virtual|real|actual|shadow dom)/i,
+                /\b(event listener|click|mutation|observer)/i
             ],
             weight: 1.0
         },
@@ -173,9 +180,65 @@ export const analyzeIntent = (userAnswer, question) => {
                 /\b(scope|closure|lexical)/i,
                 /\b(outer|inner|parent|child)/i,
                 /\b(variable|function|context)/i,
-                /\b(access|remember|retain|maintain)/i
+                /\b(access|remember|retain|maintain)/i,
+                /\b(hoisting|temporal dead zone|let|const)/i
             ],
             weight: 1.0
+        },
+        // NEW: Security & authentication
+        security: {
+            patterns: [
+                /\b(auth|login|authenticate|authorize)/i,
+                /\b(jwt|oauth|token|session|cookie)/i,
+                /\b(encrypt|hash|salt|bcrypt|ssl|tls)/i,
+                /\b(xss|csrf|injection|sanitize|validate)/i,
+                /\b(permission|role|rbac|access control)/i
+            ],
+            weight: 1.1
+        },
+        // NEW: Testing
+        testing: {
+            patterns: [
+                /\b(test|unit test|integration test|e2e)/i,
+                /\b(jest|mocha|cypress|playwright|vitest)/i,
+                /\b(mock|stub|spy|assert|expect)/i,
+                /\b(tdd|bdd|coverage|regression)/i,
+                /\b(describe|it\s+block|beforeeach|aftereach)/i
+            ],
+            weight: 0.9
+        },
+        // NEW: Networking / APIs
+        networking: {
+            patterns: [
+                /\b(api|rest|graphql|grpc|http|https)/i,
+                /\b(request|response|endpoint|route)/i,
+                /\b(get|post|put|patch|delete)\s+(request|method)/i,
+                /\b(cors|headers|status code|middleware)/i,
+                /\b(rate limit|retry|timeout|circuit breaker)/i
+            ],
+            weight: 1.0
+        },
+        // NEW: CSS & UI
+        css_styling: {
+            patterns: [
+                /\b(flexbox|grid|css|sass|styled components)/i,
+                /\b(responsive|media query|breakpoint|mobile first)/i,
+                /\b(animation|transition|transform|keyframe)/i,
+                /\b(specificity|cascade|inheritance|box model)/i,
+                /\b(rem|em|vh|vw|position|z-index)/i
+            ],
+            weight: 0.9
+        },
+        // NEW: Problem solving / behavioral
+        problem_solving: {
+            patterns: [
+                /\b(debug|troubleshoot|root cause|investigate)/i,
+                /\b(edge case|corner case|handle|cover)/i,
+                /\b(tradeoff|balance|approach|strategy)/i,
+                /\b(solution|alternative|option|decision)/i,
+                /\b(complex|challenge|difficult|bottleneck)/i
+            ],
+            weight: 0.8
         }
     };
 

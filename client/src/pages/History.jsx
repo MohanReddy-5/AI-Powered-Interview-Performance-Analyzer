@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { History as HistoryIcon, Trash2, Calendar, Target, Sparkles, ArrowLeft } from 'lucide-react';
+import { History as HistoryIcon, Trash2, Calendar, Target, Sparkles, ArrowLeft, Clock } from 'lucide-react';
 import { historyAPI } from '../services/apiClient';
 import { useAuth } from '../context/AuthContext';
 
@@ -30,7 +30,8 @@ const History = () => {
 
         try {
             await historyAPI.deleteSession(sessionId);
-            setSessions(sessions.filter(s => (s.id || s.session_id) !== sessionId));
+            // Use functional update to avoid stale closure
+            setSessions(prev => prev.filter(s => (s.id || s.session_id) !== sessionId));
 
             // Also remove from localStorage for offline consistency
             try {
@@ -42,6 +43,12 @@ const History = () => {
             } catch { /* ignore localStorage errors */ }
 
             console.log('✅ Session deleted:', sessionId);
+
+            // Reload from API to ensure UI is fully in sync
+            try {
+                const response = await historyAPI.getUserHistory();
+                setSessions(response.data.sessions);
+            } catch { /* ignore reload errors */ }
         } catch (error) {
             console.error('❌ Failed to delete session:', error);
             alert('Failed to delete session. Please try again.');
@@ -143,16 +150,34 @@ const History = () => {
                                         </div>
                                         {session.eye_contact_score !== null && session.eye_contact_score !== undefined && (
                                             <p className="text-sm text-slate-400">
-                                                Eye Contact: {Math.round(session.eye_contact_score)}%
+                                                Eye Contact: {Math.round(session.eye_contact_score <= 1 ? session.eye_contact_score * 100 : session.eye_contact_score)}%
                                             </p>
                                         )}
                                     </div>
 
                                     {/* Date */}
-                                    <div className="flex items-center gap-2 text-sm text-slate-500 mb-4">
+                                    <div className="flex items-center gap-2 text-sm text-slate-500 mb-2">
                                         <Calendar className="w-4 h-4" />
                                         {formatDate(session.created_at)}
                                     </div>
+
+                                    {/* Duration */}
+                                    {(session.total_duration_seconds || session.totalDurationSeconds) ? (
+                                        <div className="flex items-center gap-2 text-sm text-slate-500 mb-4">
+                                            <Clock className="w-4 h-4" />
+                                            <span>Duration: </span>
+                                            <span className="text-orange-400 font-mono font-medium">
+                                                {(() => {
+                                                    const sec = session.total_duration_seconds || session.totalDurationSeconds || 0;
+                                                    const m = Math.floor(sec / 60);
+                                                    const s = sec % 60;
+                                                    return `${m}:${s.toString().padStart(2, '0')}`;
+                                                })()}
+                                            </span>
+                                        </div>
+                                    ) : (
+                                        <div className="mb-4" />
+                                    )}
 
                                     {/* Actions */}
                                     <div className="flex gap-2">

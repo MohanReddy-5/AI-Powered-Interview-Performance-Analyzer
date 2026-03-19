@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useLocation, Link } from 'react-router-dom';
 import Layout from '../components/Layout';
-import { CheckCircle, AlertTriangle, ArrowRight, History, Calendar, Award, BarChart2, PieChart as PieIcon, Activity, Eye } from 'lucide-react';
+import { CheckCircle, AlertTriangle, ArrowRight, History, Calendar, Award, BarChart2, PieChart as PieIcon, Activity, Eye, Clock } from 'lucide-react';
 import { historyAPI } from '../services/apiClient';
 import EyeContactChart from '../components/EyeContactChart';
 import { getScoreColor } from '../utils/scoreColors';
@@ -98,7 +98,9 @@ const Results = () => {
                                 session: {
                                     domain: targetSession.domain || localStorage.getItem('interview_domain') || "Interview",
                                     created_at: new Date(targetSession.createdAt || Date.now()).toISOString(),
-                                    eye_contact_score: targetSession.eyeContactScore || 0
+                                    eye_contact_score: targetSession.eyeContactScore || 0,
+                                    questionTimings: targetSession.questionTimings || [],
+                                    totalDurationSeconds: targetSession.totalDurationSeconds || 0
                                 }
                             };
                             console.log("✅ Loaded session from Local Storage (Fallback active)");
@@ -112,6 +114,21 @@ const Results = () => {
                     if (!safeFeedback.length) {
                         console.warn("⚠️ No feedback items found even after fallback.");
                         // We still render, but UI will handle empty state
+                    }
+
+                    // 4) Supplement timer data from localStorage if not in API response
+                    if (!reportData.session?.totalDurationSeconds && sessionId) {
+                        try {
+                            const localSessions = JSON.parse(localStorage.getItem("interview_sessions") || "[]");
+                            const localMatch = localSessions.find(s => s.sessionId === sessionId);
+                            if (localMatch) {
+                                reportData.session = {
+                                    ...reportData.session,
+                                    questionTimings: localMatch.questionTimings || [],
+                                    totalDurationSeconds: localMatch.totalDurationSeconds || 0
+                                };
+                            }
+                        } catch { /* ignore */ }
                     }
 
                     setCurrentReport(reportData);
@@ -426,6 +443,7 @@ const Results = () => {
                                 <span className="text-sm text-slate-400 uppercase tracking-wider">Overall Score</span>
                             </div>
                             <div className="bg-slate-900 border border-slate-800 p-6 rounded-2xl flex flex-col items-center justify-center">
+                                <span className="text-xs font-semibold text-orange-400 uppercase tracking-wider mb-1">✦ AI Evaluated</span>
                                 <span className="text-2xl font-bold text-white mb-2">{currentReport.session?.domain || "Unknown"}</span>
                                 <span className="text-sm text-slate-400 uppercase tracking-wider">Interview Domain</span>
                             </div>
@@ -525,6 +543,65 @@ const Results = () => {
                                             : 0
                                     }
                                 />
+                            </div>
+
+                            {/* Interview Pace / Timer Block */}
+                            <div className="bg-slate-900/50 backdrop-blur-sm border border-slate-800 hover:border-orange-500/30 p-6 rounded-2xl transition-all flex flex-col">
+                                <h3 className="text-lg font-bold text-white mb-4 flex items-center gap-2">
+                                    <Clock className="w-5 h-5 text-orange-400" />
+                                    Interview Timing
+                                </h3>
+                                {(() => {
+                                    const totalSec = currentReport.session?.totalDurationSeconds || 0;
+                                    const timings = currentReport.session?.questionTimings || [];
+                                    const totalMin = Math.floor(totalSec / 60);
+                                    const totalRemSec = totalSec % 60;
+                                    const questionCount = timings.length || (currentReport.answers?.length || 5);
+                                    // Recommended: 1-2 min per question
+                                    const recommendedMin = questionCount * 1;
+                                    const recommendedMax = questionCount * 2;
+
+                                    return (
+                                        <div className="flex flex-col flex-1">
+                                            {/* Total Time */}
+                                            <div className="text-center mb-5">
+                                                <span className="text-4xl font-bold text-white font-mono">
+                                                    {totalMin}:{totalRemSec.toString().padStart(2, '0')}
+                                                </span>
+                                                <p className="text-sm text-slate-400 mt-1">Total Interview Time</p>
+                                            </div>
+
+                                            {/* Per-question times */}
+                                            {timings.length > 0 && (
+                                                <div className="space-y-2 mb-4">
+                                                    {timings.map((qt, i) => (
+                                                        <div key={i} className="flex justify-between items-center text-sm">
+                                                            <span className="text-slate-400">Question {i + 1}</span>
+                                                            <span className="text-white font-mono font-medium">
+                                                                {Math.floor(qt.durationSeconds / 60)}:{(qt.durationSeconds % 60).toString().padStart(2, '0')}
+                                                            </span>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            )}
+
+                                            {/* Recommended time */}
+                                            <div className="mt-auto pt-4 border-t border-slate-700/50">
+                                                <p className="text-xs text-slate-500 mb-1">Recommended Pace</p>
+                                                <p className="text-sm text-orange-400 font-medium">
+                                                    {recommendedMin}-{recommendedMax} min for {questionCount} questions
+                                                </p>
+                                                <p className="text-xs text-slate-500 mt-1">
+                                                    (~1-2 min per question is ideal)
+                                                </p>
+                                            </div>
+
+                                            {totalSec === 0 && (
+                                                <p className="text-xs text-slate-500 italic mt-2">Timing data not available for this session.</p>
+                                            )}
+                                        </div>
+                                    );
+                                })()}
                             </div>
                         </div>
 
