@@ -8,5 +8,7 @@ pydantic[email]==2.5.0
 google-genai
 spacy
 ffmpeg-python
+psycopg2-binary
+gunicorn
 # Optional: uncomment if you need server-side Whisper transcription
 # openai-whisper

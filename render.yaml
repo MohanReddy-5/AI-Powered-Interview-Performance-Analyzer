@@ -1,0 +1,25 @@
+# ============================================================
+# Render.com Blueprint — One-Click Deploy Config
+# ============================================================
+# This file tells Render how to deploy the backend.
+# Docs: https://render.com/docs/blueprint-spec
+# ============================================================
+
+services:
+  - type: web
+    name: confido-ai-backend
+    runtime: python
+    region: oregon
+    plan: free
+    rootDir: server
+    buildCommand: chmod +x build.sh && ./build.sh
+    startCommand: gunicorn main:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false  # You'll set this manually in Render dashboard
+      - key: JWT_SECRET
+        generateValue: true  # Auto-generate a secure random value
+      - key: DATABASE_URL
+        sync: false  # You'll paste the Neon connection string here
+      - key: PYTHON_VERSION
+        value: 3.11.9

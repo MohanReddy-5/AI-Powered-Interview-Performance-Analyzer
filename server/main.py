@@ -1009,7 +1009,8 @@ async def get_platform_stats_admin(admin_user: dict = Depends(get_admin_user)):
 
 if __name__ == "__main__":
     import uvicorn
-    print("\n🚀 Starting AI Interview Analyzer Backend Server...")
+    port = int(os.environ.get("PORT", 8000))
+    print(f"\n🚀 Starting AI Interview Analyzer Backend Server on port {port}...")
     print("📊 Using Production AI Models (spaCy + Whisper)")
     print("🔐 Authentication System Enabled")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=port)
