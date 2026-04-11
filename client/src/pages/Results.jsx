@@ -373,18 +373,39 @@ const Results = () => {
         console.log("\n🥧 Step 2: Processing Emotion Pie Chart");
         console.log("-".repeat(60));
 
+        // Aggregate emotion counts across ALL answers:
+        //   - Primary: use the full emotion history dict if available (e.g. { neutral: 5, happy: 2 })
+        //   - Fallback: use the dominant label for that answer (counts as 1)
         const emotionCounts = {};
         answers.forEach((a, index) => {
-            const e = a.emotions?.dominant || 'neutral';
-            emotionCounts[e] = (emotionCounts[e] || 0) + 1;
-            console.log(`   Answer ${index + 1}: ${e}`);
+            const emotionObj = a.emotions || {};
+            const history = emotionObj.history;  // { neutral: 5, happy: 2, ... }
+
+            if (history && typeof history === 'object' && Object.keys(history).length > 0) {
+                // Add all history counts to the total
+                Object.entries(history).forEach(([emotion, count]) => {
+                    emotionCounts[emotion] = (emotionCounts[emotion] || 0) + (count || 0);
+                });
+                console.log(`   Answer ${index + 1}: history=${JSON.stringify(history)}`);
+            } else {
+                // Fallback: just use dominant label
+                const dominant = emotionObj.dominant || 'neutral';
+                emotionCounts[dominant] = (emotionCounts[dominant] || 0) + 1;
+                console.log(`   Answer ${index + 1}: dominant=${dominant} (no history)`);
+            }
         });
 
-        const pData = Object.keys(emotionCounts).map(key => ({
-            name: key.charAt(0).toUpperCase() + key.slice(1),
-            value: emotionCounts[key]
-        }));
-        setPieData(pData);
+        // Filter out very small counts (< 1% of total) to keep pie readable
+        const totalEmotionCount = Object.values(emotionCounts).reduce((s, v) => s + v, 0);
+        const pData = Object.entries(emotionCounts)
+            .filter(([, count]) => count > 0 && (totalEmotionCount === 0 || count / totalEmotionCount >= 0.02))
+            .map(([key, value]) => ({
+                name: key.charAt(0).toUpperCase() + key.slice(1),
+                value
+            }))
+            .sort((a, b) => b.value - a.value); // Sort by frequency desc
+
+        setPieData(pData.length > 0 ? pData : [{ name: 'Neutral', value: 1 }]);
         console.log("   ✓ Emotion distribution:", emotionCounts);
 
         // 3. BAR DATA (Progression)

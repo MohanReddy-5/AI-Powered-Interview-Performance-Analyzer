@@ -1,12 +1,48 @@
 import sqlite3
 import json
+import os
 from datetime import datetime
 
 DB_NAME = "interview_app.db"
 
 
+def _db_path():
+    """Return an absolute path to the database file (safe regardless of CWD)."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), DB_NAME)
+
+
+def _recreate_db():
+    """Rename the corrupted DB file and create a fresh one."""
+    db_path = _db_path()
+    if os.path.exists(db_path):
+        backup = db_path + ".corrupted"
+        try:
+            os.rename(db_path, backup)
+            print(f"⚠️  Corrupted database renamed to: {backup}")
+        except Exception as rename_err:
+            print(f"⚠️  Could not rename corrupted DB: {rename_err}")
+            try:
+                os.remove(db_path)
+            except Exception:
+                pass
+    print("🔄 Creating fresh database...")
+    init_db()   # recursive call — safe because file is gone now
+
+
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
+    db_path = _db_path()
+    # ── Corruption guard ─────────────────────────────────────────
+    try:
+        probe = sqlite3.connect(db_path)
+        probe.execute("PRAGMA integrity_check")
+        probe.close()
+    except sqlite3.DatabaseError as e:
+        print(f"❌ Database integrity check failed ({e}). Auto-recovering...")
+        probe.close() if probe else None
+        _recreate_db()
+        return            # _recreate_db already called init_db recursively
+    # ─────────────────────────────────────────────────────────────
+    conn = sqlite3.connect(db_path)
     c = conn.cursor()
 
     # Create Users Table
@@ -58,12 +94,13 @@ def init_db():
         print(f"⚠️  Migration check: {e}")
 
     conn.close()
+    print(f"✅ Database ready: {db_path}")
 
 
 def verify_database():
     """Verify database is accessible and has correct schema"""
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = sqlite3.connect(_db_path())
         c = conn.cursor()
 
         # Check if all required tables exist
@@ -99,7 +136,7 @@ def verify_database():
 
 def create_user(name, email, hashed_password, is_admin=False):
     """Create a new user"""
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(_db_path())
     c = conn.cursor()
     try:
         c.execute("""INSERT INTO users (name, email, hashed_password, is_admin, created_at) 
@@ -116,7 +153,7 @@ def create_user(name, email, hashed_password, is_admin=False):
 
 def get_user_by_email(email):
     """Get user by email"""
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(_db_path())
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute("SELECT * FROM users WHERE email = ?", (email,))
@@ -127,7 +164,7 @@ def get_user_by_email(email):
 
 def get_user_by_id(user_id):
     """Get user by ID"""
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(_db_path())
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute("SELECT * FROM users WHERE id = ?", (user_id,))
@@ -138,7 +175,7 @@ def get_user_by_id(user_id):
 
 def get_all_users():
     """Get all users (admin only)"""
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(_db_path())
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute(
@@ -150,7 +187,7 @@ def get_all_users():
 
 def set_user_admin(user_id, is_admin=True):
     """Set user admin status"""
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(_db_path())
     c = conn.cursor()
     c.execute("UPDATE users SET is_admin = ? WHERE id = ?", (is_admin, user_id))
     conn.commit()
@@ -162,7 +199,7 @@ def set_user_admin(user_id, is_admin=True):
 
 
 def save_session(session_id, domain, user_id=None, eye_contact_score=None):
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(_db_path())
     c = conn.cursor()
     c.execute("""INSERT OR IGNORE INTO sessions 
                  (id, user_id, domain, created_at, overall_score, eye_contact_score) 
@@ -202,7 +239,7 @@ def save_answer(session_id, question, transcript, feedback_json, score, emotions
             print(f"⚠️  save_answer: emotions not serializable: {e}")
             emotions_str = '{}'
 
-        conn = sqlite3.connect(DB_NAME)
+        conn = sqlite3.connect(_db_path())
         c = conn.cursor()
 
         # Deduplicate: if an answer for this session+question_id already exists, UPDATE it
@@ -248,7 +285,7 @@ def save_answer(session_id, question, transcript, feedback_json, score, emotions
 
 def get_session_results(session_id):
     """Get complete session results with all metadata and answers"""
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(_db_path())
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
 
@@ -355,7 +392,7 @@ def get_session_results(session_id):
         # ALWAYS update session score (no stale cache)
         session['overall_score'] = weighted_score
         try:
-            write_conn = sqlite3.connect(DB_NAME)
+            write_conn = sqlite3.connect(_db_path())
             wc = write_conn.cursor()
             wc.execute("UPDATE sessions SET overall_score = ? WHERE id = ?",
                        (weighted_score, session_id))
@@ -377,7 +414,7 @@ def get_session_results(session_id):
 
 def get_user_sessions(user_id):
     """Get all sessions for a specific user"""
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(_db_path())
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute("""SELECT id, domain, created_at, overall_score, eye_contact_score 
@@ -391,7 +428,7 @@ def get_user_sessions(user_id):
 
 def delete_session(session_id, user_id):
     """Delete a session (with ownership check)"""
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(_db_path())
     c = conn.cursor()
 
     # Verify ownership
@@ -414,7 +451,7 @@ def delete_session(session_id, user_id):
 
 def update_session_eye_contact(session_id, eye_contact_score):
     """Update eye contact score for a session"""
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(_db_path())
     c = conn.cursor()
     c.execute("UPDATE sessions SET eye_contact_score = ? WHERE id = ?",
               (eye_contact_score, session_id))
@@ -428,7 +465,7 @@ def update_session_eye_contact(session_id, eye_contact_score):
 
 def get_platform_stats():
     """Get platform statistics (admin only)"""
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(_db_path())
     c = conn.cursor()
 
     # Total users

@@ -7,6 +7,7 @@
 import { analyzeIntent, matchIntentWithQuestion } from './intentAnalyzer.js';
 import { analyzeConceptualEquivalence, extractUserConcepts, reasonAboutEquivalence } from './semanticReasoner.js';
 import { detectNonAnswer } from './nonAnswerDetector.js';
+import { getQuestionConcepts } from '../data/questionConcepts.js';
 
 /**
  * Extract key concepts from ideal answer (inlined from removed humanAnswerMatcher.js)
@@ -114,7 +115,7 @@ export const analyzeWithSemanticBrain = (userAnswer, question, idealAnswer) => {
         userConcepts: userConcepts.map(c => c.concept),
         confidence: 0.95, // High confidence with semantic brain
         breakdown: intelligentScore.breakdown,
-        improvementPoints: generateImprovementPoints(intent, intentMatch, conceptualAnalysis),
+        improvementPoints: generateImprovementPoints(intent, intentMatch, conceptualAnalysis, question),
 
         // Detailed analysis for debugging/transparency
         details: {
@@ -226,21 +227,47 @@ const generateSemanticFeedback = (params) => {
         conceptualAnalysis,
         hasExamples,
         hasIncorrectInfo,
-        score
+        score,
+        userAnswer
     } = params;
+
+    // Look up question-specific concepts from concept map
+    const questionConcepts = getQuestionConcepts(question);
+    let coveredConcepts = [];
+    let uncoveredConcepts = [];
+
+    if (questionConcepts.length > 0 && userAnswer) {
+        const ansLower = (userAnswer || '').toLowerCase();
+        questionConcepts.forEach(concept => {
+            const terms = concept.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+            const checkTerms = terms.length > 0 ? terms : concept.toLowerCase().split(/\s+/);
+            const hits = checkTerms.filter(w => ansLower.includes(w)).length;
+            if (hits >= Math.max(1, Math.floor(checkTerms.length / 2))) {
+                coveredConcepts.push(concept);
+            } else {
+                uncoveredConcepts.push(concept);
+            }
+        });
+    } else {
+        // Fallback to semantic analysis results
+        coveredConcepts = conceptualAnalysis.understood || [];
+        uncoveredConcepts = conceptualAnalysis.missing || [];
+    }
 
     let feedback = `**Question**: "${question}"\n\n`;
 
-    // START WITH POSITIVES - Build confidence first!
-    if (conceptualAnalysis.understood.length > 0) {
-        feedback += `### ✅ Great! You demonstrated understanding of:\n`;
-        conceptualAnalysis.results
-            .filter(r => r.equivalent && r.confidence > 0.7)
-            .slice(0, 5)
-            .forEach(r => {
-                feedback += `   • **${r.idealConcept}** - You explained this well in your own words!\n`;
-            });
-        feedback += `\n`;
+    // ── What Landed (concept-focused, mentor tone) ──
+    if (coveredConcepts.length > 0) {
+        const sample = coveredConcepts.slice(0, 3);
+        const landedTemplates = [
+            `You clearly get the core idea here — your coverage of ${sample.join(', ')} shows you've actually worked with these concepts, not just read about them.`,
+            `What stood out was how naturally you brought in ${sample.join(', ')} — these are exactly what an interviewer wants to hear.`,
+            `The way you connected ${sample.join(', ')} shows real hands-on understanding. That's the kind of practical knowledge that separates strong candidates.`,
+        ];
+        const landed = landedTemplates[Math.floor(Math.random() * landedTemplates.length)];
+        feedback += `**What landed:** ${landed}\n\n`;
+    } else if (conceptualAnalysis.understood && conceptualAnalysis.understood.length > 0) {
+        feedback += `**What landed:** You showed awareness of the topic area — that's a solid starting point to build from.\n\n`;
     }
 
     // EXAMPLES (if provided)
@@ -248,18 +275,21 @@ const generateSemanticFeedback = (params) => {
         feedback += `✨ **Excellent!** You provided examples, which shows deeper understanding.\n\n`;
     }
 
-    // INTENT FEEDBACK (gentle)
-    if (intentMatch.matchScore >= 0.7) {
-        feedback += `👍 Your answer style matches what this question was looking for.\n\n`;
-    }
-
-    // AREAS TO IMPROVE (constructive, not harsh)
-    if (conceptualAnalysis.missing.length > 0) {
-        feedback += `### 💡 To make your answer even stronger, consider adding:\n`;
-        conceptualAnalysis.missing.slice(0, 3).forEach(concept => {
-            feedback += `   • ${concept}\n`;
-        });
-        feedback += `\n`;
+    // ── What's Missing (concept-focused + growth-framing) ──
+    if (uncoveredConcepts.length >= 2) {
+        const sample = uncoveredConcepts.slice(0, 3);
+        const missingTemplates = [
+            `The concepts worth building into this answer are ${sample.join(', ')} — mastering these would take your response from good to truly interview-ready.`,
+            `Where I'd push you to grow next is around ${sample.join(', ')} — these are what separate a decent answer from one that really impresses.`,
+            `To level up this answer, focus on ${sample.join(', ')} — once you've internalized these, you'll handle follow-up questions with ease.`,
+            `The depth an interviewer is looking for here includes ${sample.join(', ')} — adding these to your toolkit makes this a standout answer.`,
+        ];
+        const missing = missingTemplates[Math.floor(Math.random() * missingTemplates.length)];
+        feedback += `**What's missing:** ${missing}\n\n`;
+    } else if (uncoveredConcepts.length === 1) {
+        feedback += `**What's missing:** The one concept that would really complete this is ${uncoveredConcepts[0]} — it's the missing piece that ties everything together.\n\n`;
+    } else if (conceptualAnalysis.missing && conceptualAnalysis.missing.length > 0) {
+        feedback += `**What's missing:** Consider adding more depth around ${conceptualAnalysis.missing.slice(0, 2).join(' and ')} to round out your answer.\n\n`;
     }
 
     // INCORRECT INFORMATION (gentle correction)
@@ -267,9 +297,32 @@ const generateSemanticFeedback = (params) => {
         feedback += `📚 **Note**: Double-check some technical details - there might be a small misunderstanding. Review the concept and you'll nail it!\n\n`;
     }
 
-    // EXAMPLES SUGGESTION (if not provided)
-    if (!hasExamples && score > 50) {
-        feedback += `💡 **Pro tip**: Adding a quick example or use case would make your answer shine even more!\n\n`;
+    // ── Delivery (question-type-aware advice) ──
+    const qLower = question.toLowerCase();
+    let deliveryAdvice = '';
+    if (['explain', 'what is', 'what are', 'describe'].some(kw => qLower.includes(kw))) {
+        deliveryAdvice = 'For concept-explanation questions like this, leading with a crisp one-sentence definition before elaborating helps the interviewer anchor your answer.';
+    } else if (['difference', 'compare', 'versus', 'vs'].some(kw => qLower.includes(kw))) {
+        deliveryAdvice = 'For comparison questions, a structured side-by-side contrast with clear categories makes your answer much easier to follow.';
+    } else if (['tell me about', 'describe a time', 'give an example'].some(kw => qLower.includes(kw))) {
+        deliveryAdvice = 'For behavioral questions, the STAR format (Situation, Task, Action, Result) gives your story a clear, memorable arc.';
+    } else if (['design', 'architect', 'build'].some(kw => qLower.includes(kw))) {
+        deliveryAdvice = 'For design questions, walking through requirements then components then data flow then tradeoffs shows the structured thinking interviewers value.';
+    } else if (['how do you', 'how would you', 'how does'].some(kw => qLower.includes(kw))) {
+        deliveryAdvice = 'For process-oriented questions, describing your approach step by step with reasoning behind each choice demonstrates practical experience.';
+    } else if (['optimize', 'improve', 'performance'].some(kw => qLower.includes(kw))) {
+        deliveryAdvice = "For optimization questions, leading with 'profile first, then optimize' shows engineering maturity before diving into specific techniques.";
+    } else if (['when', 'why', 'should'].some(kw => qLower.includes(kw))) {
+        deliveryAdvice = 'For decision-making questions, showing you can reason about tradeoffs — not just list options — is what separates strong answers.';
+    }
+
+    if (deliveryAdvice) {
+        // Add speech-quality comment based on answer analysis
+        let speechNote = '';
+        if (!hasExamples && score > 50) {
+            speechNote = ' Adding a quick example or use case would make your answer even more compelling.';
+        }
+        feedback += `**Delivery:** ${deliveryAdvice}${speechNote}\n\n`;
     }
 
     // INTENT MISMATCH (gentle guidance)
@@ -293,11 +346,21 @@ const generateSemanticFeedback = (params) => {
 /**
  * Generate improvement points
  */
-const generateImprovementPoints = (intent, intentMatch, conceptualAnalysis) => {
+const generateImprovementPoints = (intent, intentMatch, conceptualAnalysis, question) => {
     const points = [];
 
-    // Missing concepts
-    if (conceptualAnalysis.missing.length > 0) {
+    // Use concept map for question-specific improvement points
+    const questionConcepts = getQuestionConcepts(question || '');
+    if (questionConcepts.length > 0) {
+        const missingConcepts = questionConcepts.filter(concept => {
+            const terms = concept.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+            return terms.length > 0;
+        });
+        if (missingConcepts.length > 0) {
+            points.push(`Key concepts to master: ${missingConcepts.slice(0, 3).join(', ')}`);
+        }
+    } else if (conceptualAnalysis.missing.length > 0) {
+        // Fallback to semantic analysis
         points.push(`Study these missing concepts: ${conceptualAnalysis.missing.slice(0, 3).join(', ')}`);
     }
 

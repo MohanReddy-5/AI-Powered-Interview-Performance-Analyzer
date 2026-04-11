@@ -96,7 +96,10 @@ export const interviewAPI = {
         apiClient.post(`/api/end-interview/${sessionId}`, { eye_contact_score: eyeContactScore }),
 
     getResults: (sessionId) =>
-        apiClient.get(`/api/results/${sessionId}`)
+        apiClient.get(`/api/results/${sessionId}`),
+
+    validateApiKey: (apiKey) =>
+        apiClient.post('/api/validate-api-key', { api_key: apiKey })
 };
 
 // ============================================================

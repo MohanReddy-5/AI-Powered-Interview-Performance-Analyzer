@@ -351,7 +351,8 @@ def _build_llm_summary(
         )
 
     if structure['has_structure']:
-        parts.append("Answer uses ordering/structure words (first, second, etc.).")
+        parts.append(
+            "Answer uses ordering/structure words (first, second, etc.).")
 
     # Repetition
     if repetition['overused_words']:
@@ -364,7 +365,8 @@ def _build_llm_summary(
     if examples['used_examples']:
         parts.append("Candidate provided concrete examples (good).")
     else:
-        parts.append("No concrete examples or real-world scenarios were given.")
+        parts.append(
+            "No concrete examples or real-world scenarios were given.")
 
     return ' '.join(parts)
 

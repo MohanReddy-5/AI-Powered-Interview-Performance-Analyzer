@@ -91,13 +91,24 @@ const Interview = () => {
             setQuestions(freshQuestions);
             setDomainTitle(selectedDomainFull.title);
 
-            // Create Session via API
-            try {
-                const response = await interviewAPI.startSession(selectedDomainFull.title);
-                setSessionId(response.data.session_id);
-            } catch (error) {
-                console.error('Failed to create session:', error);
-                alert('Failed to start interview session. Please login again.');
+            // Create Session via API — retry up to 3 times so a brief network blip
+            // doesn't abort the whole interview.
+            let sessionCreated = false;
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                try {
+                    const response = await interviewAPI.startSession(selectedDomainFull.title);
+                    setSessionId(response.data.session_id);
+                    sessionCreated = true;
+                    break;
+                } catch (error) {
+                    console.error(`Session start attempt ${attempt}/3 failed:`, error);
+                    if (attempt < 3) {
+                        await new Promise(resolve => setTimeout(resolve, 2000)); // wait 2s before retry
+                    }
+                }
+            }
+            if (!sessionCreated) {
+                alert('Could not connect to server after 3 attempts. Please check your connection and login again.');
                 navigate('/login');
                 return;
             }
@@ -471,33 +482,17 @@ const Interview = () => {
         const telemetry = { wpm, fillerCount, eyeContactScore };
         const emotionData = { dominant: dominantEmotion, history: emotionCounts };
 
-        // === HYBRID ANALYSIS (Server-side Gemini + Local scoring) ===
-        try {
-            console.log('🤖 Using hybrid analysis (server-side Gemini)...');
-            analysis = await analyzeWithGemini({
-                transcript: capturedTranscript,
-                question: currentQ.text,
-                ideal_answer: currentQ.ideal,
-                audio_blob: audioBlob
-            });
+        // === SINGLE API CALL: submit-answer handles BOTH evaluation AND saving ===
+        // Previously we called analyzeWithGemini() here AND submitAnswer() below,
+        // which doubled API usage and exhausted the free-tier quota after ~7 questions.
+        // Now we skip the separate gemini-analyze call and use submit-answer's analysis directly.
+        analysis = null; // Will be populated from submitAnswer response
 
-            // Update transcript if Gemini transcribed it
-            if (analysis.transcript && !capturedTranscript) {
-                capturedTranscript = analysis.transcript;
-                // Update ref with better transcript
-                if (answersRef.current[currentQ.id]) {
-                    answersRef.current[currentQ.id] = analysis.transcript;
-                }
-            }
-        } catch (err) {
-            console.error("Hybrid analysis error:", err);
-            analysis = await analyzeLocally(capturedTranscript, currentQ.text, { title: domainTitle }, currentQ.ideal);
-        }
-
-        // Save to Backend API
+        // Submit to Backend API — this is the ONLY API call per question
+        // The server evaluates with Gemini AND saves in one call
         if (sessionId) {
             try {
-                await interviewAPI.submitAnswer(
+                const submitResponse = await interviewAPI.submitAnswer(
                     sessionId,
                     currentQ.id, // Passed Question ID
                     currentQ.text,
@@ -509,56 +504,100 @@ const Interview = () => {
                         ? (sessionCumulativeScore.current / sessionTotalFrames.current) // decimal 0-1
                         : 0,
                     currentQ.ideal || '', // Pass ideal answer for results page
-                    audioBlob // Pass audio blob for server-side Whisper transcription
+                    audioBlob, // Pass audio blob for server-side Whisper transcription
+                    apiKey // Pass user's Gemini API key (if provided) for server-side scoring
                 );
 
-                // Store analysis result for local state/debugging if backend returns it
-                // Backend returns: { "success": true, "analysis": {...} }
-                // We use function update to NOT overwrite previous results
-                setAnalysisResults(prev => {
-                    // Use Question ID as key - PREVENTS OVERWRITING
-                    const qId = currentQ.id;
+                // Extract analysis from the server response
+                const serverData = submitResponse?.data || submitResponse;
+                if (serverData?.analysis) {
+                    analysis = serverData.analysis;
+                    console.log(`✅ Server analysis received: Score = ${analysis.score}/100`);
+                }
 
-                    const newResults = {
-                        ...prev,
-                        [qId]: {
-                            ...analysis, // Store full analysis first
-                            questionId: qId,
-                            question: currentQ.text,
-                            transcript: capturedTranscript,
-                            score: analysis?.score || 0,
-                            feedback: analysis?.feedback || "",
-                            ideal_answer: currentQ.ideal || analysis?.ideal_answer || "",
-                            status: analysis?.status || "pending",
-                        }
-                    };
-
-                    // DEBUG LOGS requested by user
-                    console.log(`\n📝 ANALYSIS STORED for Question ID: ${qId}`);
-                    console.log("answers keys:", Object.keys(newResults));
-                    console.log("analysisResults:", newResults);
-                    console.log(`Score for ${qId}:`, analysis?.score);
-
-                    return newResults;
-                });
-                // CRITICAL: Also update the ref so batch analysis has fresh data
-                analysisResultsRef.current = {
-                    ...analysisResultsRef.current,
-                    [currentQ.id]: {
-                        ...analysis,
-                        questionId: currentQ.id,
-                        question: currentQ.text,
-                        transcript: capturedTranscript,
-                        score: analysis?.score || 0,
-                        feedback: analysis?.feedback || "",
-                        ideal_answer: currentQ.ideal || analysis?.ideal_answer || "",
-                        status: analysis?.status || "pending",
+                // Update transcript if server provided a better one
+                if (serverData?.transcript && !capturedTranscript) {
+                    capturedTranscript = serverData.transcript;
+                    if (answersRef.current[currentQ.id]) {
+                        answersRef.current[currentQ.id] = serverData.transcript;
                     }
-                };
+                }
             } catch (error) {
                 console.error('Failed to save answer:', error);
                 // Continue anyway - don't block user
             }
+        }
+
+        // Fallback: if server didn't return analysis, use local scoring
+        if (!analysis) {
+            try {
+                console.log('⚠️ No server analysis — falling back to local scoring');
+                analysis = await analyzeLocally(capturedTranscript, currentQ.text, { title: domainTitle }, currentQ.ideal);
+            } catch (localErr) {
+                console.error('Local analysis also failed:', localErr);
+                analysis = {
+                    score: 0,
+                    feedback: 'Analysis unavailable. Your answer was recorded.',
+                    status: 'error',
+                    breakdown: { knowledge: 0, relevance: 0, clarity: 0, confidence: 0 },
+                    improvement_points: ['Review the ideal answer provided.']
+                };
+            }
+        }
+
+        // Build breakdown with both naming conventions for Results page compatibility
+        const breakdown = analysis.breakdown || {};
+        const techScore = breakdown.technical || breakdown.technical_score || breakdown.knowledge * 10 || 0;
+        const grammarScore = breakdown.grammar || breakdown.communication_score || breakdown.clarity * 10 || 0;
+        const accentScore = breakdown.accent || breakdown.depth_score || breakdown.relevance * 10 || 0;
+        const confScore = breakdown.confidence_score || breakdown.confidence * 10 || 0;
+
+        // Normalize analysis object for consistent client use
+        analysis = {
+            ...analysis,
+            breakdown: {
+                ...breakdown,
+                technical: techScore,
+                grammar: grammarScore,
+                accent: accentScore,
+                confidence: confScore,
+                knowledge: breakdown.knowledge || Math.round(techScore / 10),
+                relevance: breakdown.relevance || Math.round(accentScore / 10),
+                clarity: breakdown.clarity || Math.round(grammarScore / 10),
+                technical_score: techScore,
+                communication_score: grammarScore,
+                depth_score: accentScore,
+                confidence_score: confScore
+            }
+        };
+
+        // Store analysis result for local state
+        {
+            const qId = currentQ.id;
+            const resultEntry = {
+                ...analysis,
+                questionId: qId,
+                question: currentQ.text,
+                transcript: capturedTranscript,
+                score: analysis?.score || 0,
+                feedback: analysis?.feedback || "",
+                ideal_answer: currentQ.ideal || analysis?.ideal_answer || "",
+                status: analysis?.status || "pending",
+                emotions: { dominant: dominantEmotion, history: emotionCounts },
+            };
+
+            setAnalysisResults(prev => {
+                const newResults = { ...prev, [qId]: resultEntry };
+                console.log(`\n📝 ANALYSIS STORED for Question ID: ${qId}`);
+                console.log(`Score for ${qId}:`, analysis?.score);
+                return newResults;
+            });
+
+            // CRITICAL: Also update the ref so batch analysis has fresh data
+            analysisResultsRef.current = {
+                ...analysisResultsRef.current,
+                [currentQ.id]: resultEntry
+            };
         }
 
         setIsProcessing(false);
@@ -574,8 +613,15 @@ const Interview = () => {
             setIsProcessing(true); // Keep loading state
 
             // 1. FORCE ANALYSIS TRIGGER: Analyze all captured answers
-            const finalResults = await analyzeAllAnswers(answersRef.current);
-            console.log("📈 Final Analysis Results:", finalResults);
+            // Wrapped in try/catch: if batch analysis fails, we still navigate to results
+            let finalResults = {};
+            try {
+                finalResults = await analyzeAllAnswers(answersRef.current);
+                console.log("📈 Final Analysis Results:", finalResults);
+            } catch (batchErr) {
+                console.error("Batch analysis failed — using cached results:", batchErr);
+                finalResults = { ...analysisResultsRef.current };
+            }
 
             try {
                 // 1. SAFE SESSION OBJECT
@@ -608,7 +654,9 @@ const Interview = () => {
                             breakdown: breakdown, // Also keep as top-level for localStorage reads
                             improvement_points: result.improvement_points || [],
                             missing_concepts: result.missing_concepts || [],
-                            status: result.status || "completed"
+                            status: result.status || "completed",
+                            // ← Emotions per question so Results.jsx pie chart works
+                            emotions: result.emotions || { dominant: "neutral" },
                         };
                     }),
                     // Calculate overall score: WEIGHTED FORMULA
@@ -697,28 +745,41 @@ const Interview = () => {
 
             let evaluation = null;
 
+            // Use LOCAL scoring only for batch fallback — avoid extra API calls
+            // All results should already exist from per-question submit-answer calls
             try {
-                // Add delay to avoid rate limiting
-                await delay(2000);
-                evaluation = await analyzeWithGemini({
-                    transcript: transcript,
-                    question: questionText,
-                    ideal_answer: idealAnswer
-                });
+                const localResult = await analyzeLocally(transcript, questionText, { title: domainTitle }, idealAnswer);
+                evaluation = localResult;
+                console.log(`📊 Batch local score for ${qId}: ${evaluation?.score || 0}`);
             } catch (err) {
-                console.warn(`Analysis failed for ${qId}:`, err.message);
+                console.warn(`Local analysis failed for ${qId}:`, err.message);
             }
 
-            // Fallback if analysis failed
+            // Fallback if analysis failed — use local scoring instead of fixed 40
             if (!evaluation || (evaluation.score === undefined && evaluation.score !== 0)) {
-                evaluation = {
-                    score: transcript && transcript.trim().length > 10 ? 40 : 0,
-                    feedback: transcript && transcript.trim().length > 10
-                        ? "Answer recorded. AI analysis was unavailable — basic scoring applied."
-                        : "No meaningful answer detected. Please speak clearly and provide a complete answer.",
-                    status: transcript && transcript.trim().length > 10 ? 'fair' : 'poor',
-                    improvement_points: ["Study the ideal answer provided", "Practice explaining concepts clearly"],
-                };
+                try {
+                    const { analyzeWithSemanticBrain } = await import('../services/semanticBrain.js');
+                    const localResult = analyzeWithSemanticBrain(transcript, questionText, idealAnswer);
+                    evaluation = {
+                        score: localResult.score || 0,
+                        feedback: localResult.feedback || "Answer recorded. AI analysis was unavailable — local scoring applied.",
+                        status: localResult.score >= 60 ? 'good' : localResult.score >= 40 ? 'fair' : 'poor',
+                        improvement_points: localResult.improvementPoints || ["Review the ideal answer provided"],
+                    };
+                } catch (localErr) {
+                    console.warn('Local scoring also failed:', localErr);
+                    // Last resort: basic word count scoring
+                    const words = (transcript || '').trim().split(/\s+/).filter(w => w.length > 2);
+                    const baseScore = Math.min(55, Math.round(words.length * 1.5));
+                    evaluation = {
+                        score: transcript && transcript.trim().length > 10 ? baseScore : 0,
+                        feedback: transcript && transcript.trim().length > 10
+                            ? "Answer recorded. AI analysis was unavailable — basic scoring applied."
+                            : "No meaningful answer detected.",
+                        status: baseScore >= 40 ? 'fair' : 'poor',
+                        improvement_points: ["Study the ideal answer provided", "Practice explaining concepts clearly"],
+                    };
+                }
             }
 
             // Always include ideal_answer and transcript

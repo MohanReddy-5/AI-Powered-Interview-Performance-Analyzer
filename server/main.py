@@ -1,3 +1,10 @@
+from dotenv import load_dotenv
+# Load .env FIRST — before any module reads os.environ
+load_dotenv()
+
+from starlette.requests import Request as StarletteRequest
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -50,6 +57,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Global fallback: always return JSON, never crash with raw HTML 500 ──
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: StarletteRequest, exc: Exception):
+    import traceback
+    print(f"\n💥 Unhandled exception on {request.url}:")
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={"success": False,
+                 "error": "An unexpected server error occurred. Please try again."},
+    )
 
 # V2 API removed — dead code (client only calls /api/ endpoints in main.py)
 
@@ -461,7 +482,8 @@ async def submit_answer(
         "i don't have an answer", "i dont have an answer", "idk"
     ]
     lower_transcript = final_transcript.lower().strip() if final_transcript else ""
-    transcript_word_count = len([w for w in lower_transcript.split() if len(w) > 1])
+    transcript_word_count = len(
+        [w for w in lower_transcript.split() if len(w) > 1])
 
     # CRITICAL FIX: Only auto-zero for short "I don't know" answers.
     # Long answers (>20 words) that mention uncertainty briefly before explaining
@@ -482,11 +504,9 @@ async def submit_answer(
                     is_no_answer = True
                 break  # Only check first matched phrase
 
-
     is_empty = not final_transcript or len(final_transcript.strip()) == 0
     is_too_short = len(
         meaningful_words) < MIN_MEANINGFUL_WORDS and not lower_transcript
-
 
     print(f"4️⃣  Validation checks:")
     print(f"    - Is empty: {is_empty}")
@@ -530,55 +550,63 @@ async def submit_answer(
             # Use LLM Evaluator for human-like scoring (preferred)
             from services.llm_evaluator import get_llm_evaluator
 
-            # Key priority: user's submitted key (from interview modal) > server env key
-            # This allows users to use their own key and gives a fallback when server quota runs out
-            api_key = (
-                user_api_key.strip() if user_api_key and len(user_api_key.strip()) >= 20
-                else os.environ.get('GEMINI_API_KEY', '')
-            )
-            if user_api_key and len(user_api_key.strip()) >= 20:
-                print(f"🔑 Using user-provided API key for scoring")
-            else:
-                print(f"🔑 Using server API key for scoring")
-            llm_evaluator = get_llm_evaluator(api_key)
+            # Build the list of keys to try in order:
+            #   1. User-provided key (if valid)
+            #   2. Server key (always as fallback)
+            # If the first key fails (returns local_analysis), try the next one.
+            keys_to_try = []
+            user_key_clean = user_api_key.strip() if user_api_key else ''
+            server_key_clean = os.environ.get('GEMINI_API_KEY', '').strip()
 
-            # CRITICAL: If we have an ideal answer, use it for context but NOT strict comparison
-            if ideal_answer and len(ideal_answer.strip()) > 0:
-                print(f"📊 Using LLM EVALUATOR with Ideal Answer Context")
+            if user_key_clean and len(user_key_clean) >= 20:
+                keys_to_try.append(('user', user_key_clean))
+            if server_key_clean and len(server_key_clean) >= 10:
+                # Only add server key if it's different from user key
+                if server_key_clean != user_key_clean:
+                    keys_to_try.append(('server', server_key_clean))
 
-                # Use the new lenient, conceptual evaluator
-                analysis = llm_evaluator.evaluate_answer(
+            # If no keys at all, add empty so fallback handles it
+            if not keys_to_try:
+                keys_to_try.append(('none', ''))
+
+            # Get the singleton WITHOUT overwriting its default key
+            llm_evaluator = get_llm_evaluator()
+
+            analysis = None
+            ideal = ideal_answer if ideal_answer and len(ideal_answer.strip()) > 0 else None
+
+            for key_source, api_key_value in keys_to_try:
+                print(f"🔑 Trying {key_source} API key for scoring...")
+
+                result = llm_evaluator.evaluate_answer(
                     question=question,
                     user_answer=final_transcript,
                     domain=domain,
-                    ideal_answer=ideal_answer,
-                    api_key=api_key
+                    ideal_answer=ideal,
+                    api_key=api_key_value
                 )
 
-                print(
-                    f"✅ LLM analysis complete: Score = {analysis['score']}/100")
+                answer_type = result.get('answer_type', '')
+                print(f"   → Result: score={result['score']}/100, type={answer_type}")
 
-            else:
-                # Fallback to basic NLP if no ideal answer (or use LLM without it)
-                print(f"📊 Using LLM EVALUATOR (No Ideal Answer)")
-                analysis = llm_evaluator.evaluate_answer(
-                    question=question,
-                    user_answer=final_transcript,
-                    domain=domain,
-                    ideal_answer=None,
-                    api_key=api_key
-                )
-                print(
-                    f"✅ LLM analysis complete: Score = {analysis['score']}/100")
+                # If we got a REAL AI response (not fallback), use it and stop
+                if answer_type not in ('local_analysis', 'error_fallback', 'error'):
+                    analysis = result
+                    print(f"✅ AI analysis from {key_source} key: Score = {result['score']}/100")
+                    break
 
-            # Log score
-            print(f"📊 LLM score: {analysis['score']}/100")
-            # Note: non-answer enforcement is handled inside LLM evaluator and fallback scorer
-            # We do NOT override here to avoid double-penalizing 429-fallback responses
+                # If this was a non-answer detection (score=0), that's a real result — keep it
+                if answer_type in ('non_answer', 'empty'):
+                    analysis = result
+                    print(f"✅ Non-answer detected by {key_source} key: Score = 0")
+                    break
 
-            # Emotion Analysis (processed separately, not appended to answer feedback)
-            emotion_service = get_emotion_service()
-            emotion_analysis = emotion_service.analyze_emotions(emotions_data)
+                # local_analysis/error = key failed (rate limited or error)
+                # Try the next key
+                print(f"⚠️ {key_source} key returned fallback — trying next key...")
+                analysis = result  # keep as fallback in case no key works
+
+            print(f"📊 Final score: {analysis['score']}/100 (type: {analysis.get('answer_type', 'unknown')})")
 
             if ideal_answer:
                 analysis["ideal_answer"] = ideal_answer
@@ -588,13 +616,41 @@ async def submit_answer(
             import traceback
             traceback.print_exc()
 
-            analysis = {
-                "score": 0,
-                "feedback": f"⚠️ AI analysis encountered an error: {str(e)}. Your answer was recorded but couldn't be scored. Please try again.",
-                "status": "error",
-                "metrics": {"error": str(e)},
-                "missing_keywords": []
-            }
+            # Use the fallback scorer to produce a REAL score based on the answer
+            # instead of giving everyone a flat 50/100
+            try:
+                from services.llm_evaluator import get_llm_evaluator
+                from utils.speech_analyzer import analyze_speech_quality
+                fallback_evaluator = get_llm_evaluator()
+                speech_data = analyze_speech_quality(final_transcript)
+                analysis = fallback_evaluator._create_fallback_response(
+                    final_transcript, question, ideal_answer, speech_data
+                )
+                analysis["answer_type"] = "error_fallback"
+                print(f"📊 Error fallback score: {analysis['score']}/100")
+            except Exception as fallback_err:
+                print(f"❌ Fallback also failed: {fallback_err}")
+                analysis = {
+                    "score": 0,
+                    "feedback": "AI analysis encountered an issue. Your answer was recorded.",
+                    "status": "error",
+                    "breakdown": {"knowledge": 0, "relevance": 0, "clarity": 0, "confidence": 0,
+                                  "technical": 0, "grammar": 0, "accent": 0,
+                                  "technical_score": 0, "communication_score": 0,
+                                  "depth_score": 0, "confidence_score": 0},
+                    "improvement_points": ["Review the ideal answer and compare with what you said."],
+                    "missing_keywords": [],
+                    "answer_type": "error_fallback"
+                }
+
+        # Emotion Analysis — in a separate try/except so it can never crash the endpoint
+        try:
+            emotion_service = get_emotion_service()
+            emotion_analysis = emotion_service.analyze_emotions(emotions_data)
+        except Exception as emo_err:
+            print(f"⚠️ Emotion analysis failed (non-critical): {emo_err}")
+            emotion_analysis = {"dominant_emotion": "neutral",
+                                "score": 50, "feedback": "Emotion data unavailable"}
 
     # ============================================================
     # ENSURE ideal_answer IS IN analysis BEFORE saving
@@ -780,26 +836,80 @@ class GeminiAnalyzeRequest(BaseModel):
     transcript: str
     question: str
     ideal_answer: Optional[str] = None
+    user_api_key: Optional[str] = None
+
+
+class ValidateApiKeyRequest(BaseModel):
+    api_key: str
+
+
+@app.post("/api/validate-api-key")
+async def validate_api_key(req: ValidateApiKeyRequest, current_user: dict = Depends(get_current_user)):
+    """
+    Validate a user-provided Gemini API key by making a tiny test call.
+    Returns {"valid": true/false, "message": "..."}.
+    """
+    key = (req.api_key or '').strip()
+    if not key or len(key) < 10:
+        return {"valid": False, "message": "API key is too short or empty."}
+
+    try:
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=key)
+        # Minimal test call — uses almost no quota
+        response = client.models.generate_content(
+            model='gemini-2.0-flash',
+            contents='Reply with the single word OK',
+            config=types.GenerateContentConfig(temperature=0.0)
+        )
+        resp_text = response.text if response else None
+        if resp_text:
+            print(f"✅ User API key validated successfully")
+            return {"valid": True, "message": "API key is valid and working!"}
+        else:
+            return {"valid": False, "message": "API key returned empty response. Please check the key."}
+    except Exception as e:
+        error_str = str(e)
+        print(f"❌ User API key validation failed: {error_str}")
+        if '401' in error_str or 'UNAUTHENTICATED' in error_str or 'invalid' in error_str.lower():
+            return {"valid": False, "message": "Invalid API key. Please check and try again."}
+        elif '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
+            # Key is valid but rate limited — still valid
+            return {"valid": True, "message": "API key is valid (currently rate-limited, but it will work)."}
+        elif '403' in error_str or 'PERMISSION_DENIED' in error_str:
+            return {"valid": False, "message": "API key lacks permission. Enable the Generative Language API in Google Cloud Console."}
+        else:
+            return {"valid": False, "message": f"Could not validate key: {error_str[:120]}"}
 
 
 @app.post("/api/gemini-analyze")
 async def gemini_analyze(req: GeminiAnalyzeRequest, current_user: dict = Depends(get_current_user)):
     """
     Server-side proxy for Gemini analysis.
-    The client sends transcript + question, the server calls Gemini using its own API key.
-    This keeps the API key completely hidden from the browser.
+    Routes through the LLMEvaluator singleton so that rate-limit state is shared
+    with /api/submit-answer. This prevents the double-API-call per question that
+    was causing 429 cascades and scoring all answers at 50.
     """
-    import json as _json
 
-    api_key = os.environ.get('GEMINI_API_KEY', '').strip()
-    if not api_key or len(api_key) < 10:
-        raise HTTPException(status_code=500, detail="Server Gemini API key not configured")
+    # Key cascade: user's key > server env key
+    user_key = (req.user_api_key or '').strip()
+    server_key = os.environ.get('GEMINI_API_KEY', '').strip()
+
+    # Build key list to try in order
+    keys_to_try = []
+    if user_key and len(user_key) >= 20:
+        keys_to_try.append(('user', user_key))
+    if server_key and len(server_key) >= 10 and server_key != user_key:
+        keys_to_try.append(('server', server_key))
+    if not keys_to_try:
+        keys_to_try.append(('none', ''))
 
     transcript = (req.transcript or '').strip()
     question = req.question or ''
     ideal_answer = req.ideal_answer or ''
 
-    # If transcript is empty, return zero immediately
+    # Empty transcript → return zero immediately (no API call)
     if not transcript or len(transcript) < 3:
         return {
             "success": True,
@@ -818,189 +928,65 @@ async def gemini_analyze(req: GeminiAnalyzeRequest, current_user: dict = Depends
             }
         }
 
-    # Run speech quality analysis
-    from utils.speech_analyzer import analyze_speech_quality
-    speech_metrics = analyze_speech_quality(transcript)
-    speech_summary = speech_metrics.get('summary_for_llm', '')
-
-    # Build prompt with speech quality metrics
-    prompt = f"""You are a PRECISE and FAIR interview coach. You evaluate BOTH the content of the answer AND the delivery quality (how they said it). Do NOT inflate scores — differentiate clearly between weak, average, and strong answers.
-
-**QUESTION:** {question}
-
-**CANDIDATE'S ANSWER:** {transcript}
-
-**IDEAL ANSWER (reference for evaluation):** {ideal_answer or 'Not provided'}
-
-**SPEECH QUALITY ANALYSIS (measured from transcript):**
-{speech_summary}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STEP 1 — CHECK FOR NON-ANSWERS (mandatory, do this first):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-If the answer matches ANY of these → set ALL scores to 0 immediately:
-  • "I don't know", "I have no idea", "I can't answer", "skip", "pass", any refusal
-  • Empty response, just filler sounds ("um", "uh", "hmm"), or fewer than 3 real words
-  • Single words that don't demonstrate knowledge (e.g., "yes", "no", "maybe")
-  • Content COMPLETELY UNRELATED to the question (no topical connection at all)
-
-STEP 2 — SCORE ACCURATELY WITH CALIBRATION:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-This is a SPOKEN exam. Be accurate, fair, and generous for genuine understanding.
-
-SCORING SCALE (calibrated — use the FULL range):
-  0       → Non-answer, refusal, "I don't know", completely unrelated
-  5-15    → Completely off-topic or unrelated content
-  18-30   → Barely relevant, vague awareness but major confusion
-  32-48   → Shows some understanding but misses most key concepts
-  50-65   → Partial understanding, covers a few key points but incomplete
-  68-80   → Good answer, covers most concepts correctly with reasonable depth
-  82-92   → Strong, comprehensive with good technical accuracy
-  93-100  → Exceptional, covers all concepts with expert-level insight and examples
-
-DIMENSION-SPECIFIC RULES:
-• technical: Score based on ACTUAL technical accuracy. Wrong facts = low score. Vague generalities = 35-50 max. Correct explanation in own words = high score.
-• grammar: For spoken language, be lenient (65+ if understandable). Only penalize for truly unclear communication.
-• accent: Score clarity of expression and articulation (65+ if reasonably clear).
-• confidence: Score based on how structured and decisive the answer sounds. Use the speech analysis above for filler words and hedging.
-
-SPECIAL CASES:
-• BEHAVIORAL/SOFT SKILLS questions (teamwork, leadership, etc.): Any thoughtful personal answer = 65+. Genuine reflection with specific examples = 75+.
-• SHORT BUT CORRECT: A brief but accurate answer can score 65-78. Conciseness is not penalized if the understanding is clear.
-• PARAPHRASING: Informal explanations of concepts get FULL credit if the understanding is correct. Correct understanding in own words = same score as textbook answer.
-• CONCEPTS EXPLAINED DIFFERENTLY: If the candidate demonstrates the right understanding, score it the same as if they used exact terminology.
-
-⚠️ CALIBRATION: A mediocre answer = 35-50. A correct but incomplete answer = 58-68. A correct and well-explained answer = 70-85. Do NOT deflate scores for correct answers.
-
-**DIMENSIONS (each 0-100):**
-- overall_score: Overall quality using the calibrated scale above
-- technical: Technical accuracy (correct content = high scores, vague generalities = 35-50 max)
-- grammar: Language quality (lenient for spoken, 65+ baseline if understandable)
-- accent: Clarity of expression
-- confidence: Decisiveness and structure
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STEP 3 — GENERATE VARIED FEEDBACK ON CONTENT AND DELIVERY (CRITICAL):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-⚠️ ABSOLUTE RULE: Your feedback MUST cover BOTH content accuracy AND delivery quality.
-
-**FEEDBACK VARIETY — CRITICAL:**
-You MUST vary how you open and structure your feedback. Pick a DIFFERENT opener for each response:
-  Option A: "[Candidate's specific point] — you correctly explained [X], though [delivery/content gap]."
-  Option B: "Your understanding of [concept] came through clearly. [Delivery observation based on speech analysis]."
-  Option C: "The strongest part of your answer was [specific point]. To sharpen it, [specific improvement needed]."
-  Option D: "You demonstrated [concept] well by [specific paraphrase of their words]. [One honest delivery critique]."
-  Option E: "Solid grasp of [topic] — you covered [key point]. [Speech-quality observation from analysis data]."
-  Option F: "[Direct observation about what they said first], which shows [assessment]. [Delivery note]."
-NEVER use the same opener twice. Quote or paraphrase what the candidate ACTUALLY SAID — make feedback feel personal, not generic.
-
-**FEEDBACK rules (content + delivery):**
-- First, evaluate WHAT they said: concepts they got right, concepts they missed
-- Second, evaluate HOW they said it: filler words, hedging, structure, confidence — reference the SPEECH QUALITY ANALYSIS data above
-- If the candidate explained the concept correctly but used different words than the ideal, give FULL credit
-- MUST be unique to THIS answer — never write generic advice like "study more" or "mention keyword X"
-
-**IMPROVEMENT_POINTS rules (3 specific, actionable coaching tips):**
-- Mix CONTENT tips and DELIVERY tips (not all one type)
-- Content: name the exact concept they missed or misexplained, and what the correct explanation is
-- Delivery: call out a specific habit from speech analysis (e.g., "You said 'I think' 3 times — replace with confident assertions")
-- Action-oriented: tell them WHAT TO DO, not just what was wrong
-- BAD: ["Study the topic more", "Include 'polymorphism'"]
-- GOOD: ["You said 'I think' twice — replace with 'Closures work by...' to sound confident", "Add a concrete example like a counter function to make closures tangible", "Structure: define the term → explain how it works → give a real-world use case"]
-
-**MISSING_CONCEPTS rules:**
-- List ONLY concepts present in the ideal answer but ABSENT from the candidate's answer
-
-Return ONLY valid JSON (no markdown, no code fences):
-{{
-  "overall_score": <0-100>,
-  "technical": <0-100>,
-  "grammar": <0-100>,
-  "accent": <0-100>,
-  "confidence": <0-100>,
-  "feedback": "<2-3 sentences covering content accuracy AND delivery quality, referencing what the candidate actually said>",
-  "technical_feedback": "<1 sentence on what was technically correct/incorrect>",
-  "grammar_feedback": "<1 sentence on their communication/delivery style, referencing speech analysis>",
-  "missing_concepts": ["<specific concept from ideal answer not in candidate's answer>"],
-  "improvement_points": ["<specific content or delivery coaching tip for THIS answer>"],
-  "status": "<excellent|good|fair|poor>"
-}}"""
-
-    # Call Gemini with model fallback (same logic as client-side)
     try:
-        genai, types = None, None
-        try:
-            from google import genai as _genai_module
-            from google.genai import types as _genai_types
-            genai = _genai_module
-            types = _genai_types
-        except ImportError:
-            # Fallback to google-generativeai package
-            pass
+        # ── Delegate to the singleton so rate-limit state is shared globally ──
+        from services.llm_evaluator import get_llm_evaluator
+        evaluator = get_llm_evaluator()
 
-        if genai:
-            client = genai.Client(api_key=api_key)
-            model_candidates = [
-                'models/gemini-2.5-flash-lite',
-                'models/gemini-flash-lite-latest',
-                'models/gemini-2.0-flash-lite',
-                'models/gemini-2.0-flash',
-                'models/gemini-flash-latest',
-            ]
-            last_error = None
-            response_text = None
-            for model_name in model_candidates:
-                try:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            temperature=0.3,
-                            response_mime_type='application/json'
-                        )
-                    )
-                    response_text = response.text
-                    break
-                except Exception as model_err:
-                    err_str = str(model_err)
-                    if '404' in err_str or 'NOT_FOUND' in err_str:
-                        last_error = model_err
-                        continue
-                    raise
+        result = None
+        for key_source, api_key_value in keys_to_try:
+            print(f"🔑 Gemini proxy: Trying {key_source} API key...")
 
-            if response_text is None:
-                raise last_error or Exception("All Gemini model candidates failed")
-        else:
-            raise ImportError("No google-genai package available")
+            r = evaluator.evaluate_answer(
+                question=question,
+                user_answer=transcript,
+                domain="general",
+                ideal_answer=ideal_answer if ideal_answer else None,
+                api_key=api_key_value
+            )
 
-        # Parse response
-        import re as _re
-        text = response_text.strip()
-        text = _re.sub(r'^```(?:json)?\s*', '', text, flags=_re.MULTILINE)
-        text = _re.sub(r'\s*```$', '', text, flags=_re.MULTILINE)
-        text = text.strip()
+            answer_type = r.get('answer_type', '')
+            if answer_type not in ('local_analysis', 'error_fallback', 'error') or answer_type in ('non_answer', 'empty'):
+                result = r
+                print(f"✅ Gemini proxy: {key_source} key succeeded (score={r['score']})")
+                break
 
-        try:
-            analysis = _json.loads(text)
-        except _json.JSONDecodeError:
-            match = _re.search(r'\{.*\}', text, _re.DOTALL)
-            if match:
-                analysis = _json.loads(match.group())
-            else:
-                raise ValueError("Could not parse Gemini response as JSON")
+            print(f"⚠️ Gemini proxy: {key_source} key returned fallback — trying next...")
+            result = r  # keep fallback in case no key works
 
-        print(f"✅ Gemini proxy: score={analysis.get('overall_score', '?')}")
+        # Map LLMEvaluator result → legacy client-expected format
+        score = result.get("score", 0)
+        breakdown = result.get("breakdown", {})
+        feedback = result.get("feedback", "")
+        improvement_points = result.get("improvement_points", [])
+
+        analysis = {
+            "overall_score": score,
+            "technical": breakdown.get("technical", breakdown.get("technical_score", score)),
+            "grammar": breakdown.get("grammar", breakdown.get("communication_score", score)),
+            "accent": breakdown.get("accent", breakdown.get("depth_score", score)),
+            "confidence": breakdown.get("confidence_score", score),
+            "feedback": feedback,
+            "technical_feedback": "",
+            "grammar_feedback": "",
+            "missing_concepts": [],
+            "improvement_points": improvement_points,
+            "status": result.get("status", "fair"),
+            "answer_type": result.get("answer_type", "evaluated")
+        }
+
+        print(f"✅ Gemini proxy (via singleton): score={score}")
         return {"success": True, "analysis": analysis}
 
     except Exception as e:
         print(f"❌ Gemini proxy error: {e}")
-        # Return error so client can fall back to local scoring
         return {
             "success": False,
             "error": str(e),
             "analysis": None
         }
+
+
 
 
 # ============================================================

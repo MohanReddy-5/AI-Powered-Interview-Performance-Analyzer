@@ -31,8 +31,8 @@ function stripFences(text) {
  * 
  * This is the ONLY function called by Interview.jsx.
  * Its signature and return format are IDENTICAL to the old version.
- * NOTE: apiKey parameter is NO LONGER NEEDED (server uses its own key)
- *       but kept for backward compatibility — it is simply ignored.
+ * NOTE: The user's Gemini API key (if provided) is read from localStorage
+ *       and forwarded to the server so it can prioritize it over the server key.
  */
 export async function analyzeWithGemini(params) {
     const { transcript, question, ideal_answer, audio_blob, apiKey } = params;
@@ -85,7 +85,8 @@ export async function analyzeWithGemini(params) {
             body: JSON.stringify({
                 transcript: finalTranscript,
                 question: question,
-                ideal_answer: ideal_answer || ''
+                ideal_answer: ideal_answer || '',
+                user_api_key: localStorage.getItem('gemini_api_key') || ''
             })
         });
 

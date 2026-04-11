@@ -129,7 +129,8 @@ class NLPService:
             for phrase in dont_know_phrases:
                 if phrase in text_lower:
                     without_phrase = text_lower.replace(phrase, '').strip()
-                    remaining_words = [w for w in without_phrase.split() if len(w) > 2]
+                    remaining_words = [
+                        w for w in without_phrase.split() if len(w) > 2]
                     if len(remaining_words) < 8:
                         return {
                             "score": 0,
@@ -333,7 +334,8 @@ class NLPService:
                 "Vocabulary is repetitive — try to use synonyms or different terms "
                 "to show breadth of knowledge.")
         elif vocab_ratio >= 0.7:
-            feedback_parts.append("Strong vocabulary diversity — well-varied language.")
+            feedback_parts.append(
+                "Strong vocabulary diversity — well-varied language.")
 
         # Technical depth
         tech_terms = metrics["technical_terms"]
@@ -356,7 +358,8 @@ class NLPService:
                 "The answer was one long run-on sentence. "
                 "Break it into 2–3 clear sentences for clarity.")
         elif sentence_count >= 3:
-            feedback_parts.append("Clear multi-sentence structure — easy to follow.")
+            feedback_parts.append(
+                "Clear multi-sentence structure — easy to follow.")
 
         return " ".join(feedback_parts)
 

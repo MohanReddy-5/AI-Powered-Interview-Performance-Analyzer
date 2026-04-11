@@ -21,6 +21,7 @@ build/
 
 # Database
 *.db
+*.db.bak
 *.sqlite
 *.sqlite3
 

@@ -25,6 +25,10 @@ import threading
 
 logger = logging.getLogger(__name__)
 
+# Global timestamp of the last Gemini API call (used to enforce minimum inter-call gap).
+# A mutable list so it can be modified from inside a thread function without nonlocal.
+_last_api_call_time: list = [0.0]
+
 # Lazy import at call time to avoid module-level crashes
 _genai = None
 _genai_types = None
@@ -63,17 +67,23 @@ class LLMEvaluator:
         # Priority: explicit arg > environment variable
         self.api_key = api_key or os.environ.get('GEMINI_API_KEY')
         self.max_retries = 2          # per individual call
-        self.call_timeout = 25        # seconds per API call
-        # Try these models in order — first available wins
-        # NOTE: gemini-2.5-flash-lite is listed first because 2.0-flash has
-        # a smaller free-tier daily quota that can be exhausted quickly.
+        self.call_timeout = 30        # seconds per API call
+        # CONFIRMED working Gemini model names (verified against API).
+        # Only use names that are actually available on the free tier.
+        # Invalid names cause non-404 errors that bypass the try-next-model
+        # logic and hit the 429 handler instead, wasting quota rapidly.
         self.model_candidates = [
-            'models/gemini-2.5-flash-lite',
-            'models/gemini-flash-lite-latest',
-            'models/gemini-2.0-flash-lite',
-            'models/gemini-2.0-flash',
-            'models/gemini-flash-latest',
+            'gemini-2.0-flash',          # Highest free-tier RPM (primary)
+            'gemini-1.5-flash',          # Reliable fallback, high free-tier quota
+            'gemini-1.5-flash-8b',       # Lightest fallback
         ]
+        # Rate-limit cooldown: when a 429 is received, block further API calls
+        # for `rate_limit_cooldown` seconds to let the full quota minute reset.
+        # Free tier = 15 RPM. One call per question.
+        self._rate_limit_until: float = 0.0   # Unix timestamp; 0 = not limited
+        self._rate_limited_key: str = ''       # Which key triggered the cooldown
+        self._rate_limit_lock = threading.Lock()
+        self.rate_limit_cooldown = 65          # seconds to wait after a 429
 
     def evaluate_answer(
         self,
@@ -87,8 +97,35 @@ class LLMEvaluator:
         """
         Evaluate an interview answer using rubric-based scoring.
         Each call creates its own client to avoid shared-state timeouts.
+
+        API Key Priority:
+          1. Per-call `api_key` parameter (user-provided key)
+          2. Singleton's self.api_key (set at init from env)
+          3. Live os.environ['GEMINI_API_KEY'] (re-read every call)
         """
-        active_api_key = (api_key or self.api_key or "").strip()
+        # ── API KEY CASCADE ───────────────────────────────────────────
+        # Step 1: prefer the per-call key if it looks valid
+        active_api_key = (api_key or "").strip()
+        key_source = "user-provided"
+
+        # Step 2: fall back to the singleton's stored key
+        if not active_api_key or len(active_api_key) < 10:
+            active_api_key = (self.api_key or "").strip()
+            key_source = "singleton"
+
+        # Step 3: fall back to live env var (covers late .env edits)
+        if not active_api_key or len(active_api_key) < 10:
+            active_api_key = os.environ.get('GEMINI_API_KEY', '').strip()
+            key_source = "env-var"
+            # Also update the singleton so next call doesn't repeat this
+            if active_api_key and len(active_api_key) >= 10:
+                self.api_key = active_api_key
+
+        if active_api_key and len(active_api_key) >= 10:
+            masked = active_api_key[:8] + '***'
+            print(f"🔑 LLM Evaluator: Using {key_source} API key ({masked})")
+        else:
+            print(f"⚠️ LLM Evaluator: No valid API key found from any source")
 
         # ── PRE-LLM: Check for non-answers BEFORE wasting API quota ──
         non_answer = self._is_non_answer(user_answer)
@@ -125,7 +162,39 @@ class LLMEvaluator:
             logger.warning("No API key — AI scoring unavailable")
             return self._create_fallback_response(user_answer, question, ideal_answer, speech_metrics)
 
-        print(f"🤖 LLM Evaluator: Starting analysis for question: '{question[:30]}...'")
+        # ── Honor the 429 cooldown window ──────────────────────────────────────
+        # If we hit a rate limit recently, skip the API call entirely and return
+        # the fallback until the quota window resets. This prevents every
+        # subsequent question in the session from burning retries and failing.
+        # CRITICAL: Only apply cooldown if using the SAME key that triggered it.
+        # If the user provided their OWN key, bypass the cooldown — their key
+        # has its own quota.
+        server_key = os.environ.get('GEMINI_API_KEY', '').strip()
+        is_user_key = api_key and api_key.strip(
+        ) != server_key and len(api_key.strip()) >= 20
+        with self._rate_limit_lock:
+            cooldown_active = time.time() < self._rate_limit_until
+            cooldown_key = self._rate_limited_key
+
+        if cooldown_active:
+            # Check if the active key is the SAME key that caused the cooldown
+            key_matches_cooldown = (
+                active_api_key.strip() == cooldown_key
+                or (not is_user_key and cooldown_key == server_key)
+            )
+            if key_matches_cooldown:
+                remaining = int(self._rate_limit_until - time.time())
+                print(
+                    f"⏳ LLM Evaluator: rate-limit cooldown active — {remaining}s remaining. Using fallback.")
+                logger.warning(
+                    "Rate-limit cooldown active (%ds remaining) — skipping API call.", remaining)
+                return self._create_fallback_response(user_answer, question, ideal_answer, speech_metrics)
+            else:
+                print(
+                    f"🔑 Using different API key — bypassing cooldown for rate-limited key")
+
+        print(
+            f"🤖 LLM Evaluator: Starting analysis for question: '{question[:30]}...'")
 
         # Sanitize inputs to prevent JSON injection in prompt
         safe_question = self._sanitize_text(question)
@@ -137,12 +206,24 @@ class LLMEvaluator:
         # Independent retry loop per call
         for attempt in range(self.max_retries + 1):
             try:
-                # Small courtesy delay to avoid hitting free-tier rate limits (60 req/min)
+                # Enforce minimum 6s gap between ALL API calls (free tier = 15 RPM = 4s/req).
+                # We add a 2s safety buffer to stay well under the limit.
+                # _last_api_call_time is tracked globally on the singleton.
+                _min_gap = 6.0
+                with self._rate_limit_lock:
+                    elapsed = time.time() - _last_api_call_time[0]
+                    if elapsed < _min_gap:
+                        wait_needed = _min_gap - elapsed
+                    else:
+                        wait_needed = 0.0
+
+                if wait_needed > 0:
+                    logger.debug(
+                        "Inter-call throttle: sleeping %.1fs", wait_needed)
+                    time.sleep(wait_needed)
+
                 if attempt > 0:
-                    time.sleep(2.5 * attempt)
-                else:
-                    # ~75 req/min safety buffer on first attempt
-                    time.sleep(0.8)
+                    time.sleep(3.0 * attempt)
 
                 result = self._evaluate_with_timeout(
                     question=safe_question,
@@ -172,17 +253,24 @@ class LLMEvaluator:
 
             except Exception as e:
                 error_str = str(e)
-                # 429 = quota exhausted — retrying immediately wastes quota, use fallback
+                # 429 = quota exhausted — set cooldown window so subsequent
+                # questions in this session skip the API gracefully
                 if '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
+                    retry_after = self._parse_retry_after(error_str)
+                    with self._rate_limit_lock:
+                        self._rate_limit_until = time.time() + retry_after
+                        self._rate_limited_key = active_api_key.strip()
                     logger.warning(
-                        "Rate limited (429) on attempt %d — using fallback.", attempt + 1)
-                    print(f"⚠️ LLM Evaluator: Rate limited (429).")
+                        "Rate limited (429) on attempt %d — cooldown set for %ss.",
+                        attempt + 1, retry_after)
+                    print(
+                        f"⚠️ LLM Evaluator: Rate limited (429). Cooling down for {retry_after}s before next call.")
                     break
-                
+
                 logger.error(
                     "LLM evaluation error (attempt %d): %s", attempt + 1, e)
                 print(f"❌ LLM Evaluator error (attempt {attempt + 1}): {e}")
-                
+
                 if attempt < self.max_retries:
                     time.sleep(1.5 * (attempt + 1))
                     continue
@@ -223,20 +311,42 @@ class LLMEvaluator:
                 last_error = None
                 for model_name in self.model_candidates:
                     try:
+                        # NOTE: response_mime_type='application/json' is intentionally
+                        # omitted here. When set, some model versions return a
+                        # "Invalid mime type" error that is NOT a 404, which caused
+                        # the exception to propagate immediately and trigger 429 handling
+                        # on the outer loop instead of trying the next model.
+                        # We parse JSON manually in _parse_llm_response instead.
                         response = client.models.generate_content(
                             model=model_name,
                             contents=prompt,
                             config=types.GenerateContentConfig(
-                                temperature=0.5,
-                                response_mime_type='application/json'
+                                temperature=0.5
                             )
                         )
+                        # Record call time IMMEDIATELY (even on failure — it still used quota)
+                        _last_api_call_time[0] = time.time()
+
+                        # Safety: response.text can be None or raise if response was
+                        # blocked by safety filters, or if the response object is malformed.
+                        resp_text = None
+                        try:
+                            resp_text = response.text if response else None
+                        except Exception:
+                            resp_text = None
+
+                        if not resp_text:
+                            raise ValueError(
+                                f"Empty or blocked response from model {model_name}")
+
                         result_holder['value'] = self._parse_llm_response(
-                            response.text)
+                            resp_text)
                         break  # success
                     except Exception as model_err:
                         err_str = str(model_err)
-                        if '404' in err_str or 'NOT_FOUND' in err_str:
+                        if ('404' in err_str or 'NOT_FOUND' in err_str
+                                or 'not found' in err_str.lower()
+                                or 'Empty or blocked response' in err_str):
                             last_error = model_err
                             continue  # try next model
                         raise  # non-404 errors propagate immediately
@@ -348,6 +458,14 @@ class LLMEvaluator:
             "answer_type": "evaluated"
         }
 
+    def _parse_retry_after(self, error_str: str) -> float:
+        """Extract Retry-After seconds from a 429 error string.
+        Falls back to self.rate_limit_cooldown if not present."""
+        match = re.search(r'retry.?after[:\s]+(\d+)', error_str, re.I)
+        if match:
+            return float(match.group(1)) + 5   # +5s buffer
+        return self.rate_limit_cooldown
+
     def _sanitize_text(self, text: str) -> str:
         """Remove characters that can break JSON string embedding in prompts."""
         if not text:
@@ -383,6 +501,35 @@ You evaluate BOTH the content of the answer AND the delivery quality (how they s
             prompt += f"\n**SPEECH QUALITY ANALYSIS (measured from transcript):**\n{speech_metrics['summary_for_llm']}\n"
 
         prompt += """
+⚠️ CRITICAL — SPEECH-TO-TEXT TRANSCRIPT AWARENESS:
+The candidate's answer above was captured via speech recognition (browser Web Speech API).
+Speech-to-text often GARBLES technical terms. You MUST evaluate the INTENDED MEANING, not exact wording.
+
+Common speech-to-text errors to mentally correct before scoring:
+  • "clo sure" / "klosure" → closure
+  • "poly more fizz um" / "polly morphism" → polymorphism
+  • "you state" / "used state" → useState (React hook)
+  • "you effect" / "used effect" → useEffect
+  • "proto type" / "proto typical" → prototype / prototypal
+  • "a sink" / "a sync" → async
+  • "ho isting" / "hosting" (in JS context) → hoisting
+  • "in capsule ation" / "and capsulation" → encapsulation
+  • "in hair attends" / "in heritance" → inheritance
+  • "destructor ring" / "this structuring" → destructuring
+  • "ab straction" / "abstract ion" → abstraction
+  • "prom is" / "proms" → promise / promises
+  • "virtual dumb" / "virtual dome" → Virtual DOM
+  • "jason" / "jay son" → JSON
+  • "my sequel" → MySQL, "post gres" → PostgreSQL, "mongo db" → MongoDB
+  • "dock er" / "darker" → Docker, "cube ernetes" → Kubernetes
+  • Letters spoken individually: "a p i" → API, "j w t" → JWT, "c i c d" → CI/CD
+
+SCORING RULE: If you can INFER the correct technical term from the garbled text,
+score the answer AS IF the correct term was used. Do NOT penalize for speech recognition errors.
+Only penalize for genuinely wrong or missing concepts.
+
+"""
+        prompt += """
 STEP 1 — CHECK FOR NON-ANSWERS (do this first, mandatory):
 These MUST get ALL scores = 0 immediately:
   • "I don't know", "no idea", "skip", "pass", any refusal
@@ -406,38 +553,69 @@ SPECIAL CASES:
 
 ⚠️ CALIBRATION: A mediocre answer = 3-5. A correct but incomplete answer = 6-7. A correct and well-explained answer = 7-9. Do NOT deflate scores for correct answers.
 
-STEP 3 — GENERATE RESPONSE-SPECIFIC FEEDBACK (CRITICAL — vary style every time):
+STEP 3 — GENERATE STRUCTURED MENTOR-STYLE FEEDBACK:
 
-⚠️ ABSOLUTE RULE: Your feedback MUST cover BOTH content accuracy AND delivery quality.
+⚠️ YOUR ROLE: You are a warm, supportive senior engineer giving 1-on-1 coaching over coffee. Be specific about what they nailed, honest about what's missing, and always leave them feeling motivated.
 
-**FEEDBACK VARIETY — CRITICAL:**
-You MUST vary how you open and structure your feedback each time. Pick a DIFFERENT opener from this list for each response:
-  Option A: "[Candidate's specific point] — you correctly explained [X], though [delivery/content gap]."
-  Option B: "Your understanding of [concept] came through clearly. [Delivery observation based on speech analysis]."
-  Option C: "The strongest part of your answer was [specific point]. To sharpen it, [specific improvement needed]."
-  Option D: "You demonstrated [concept] well by [specific paraphrase of their words]. [One honest delivery critique]."
-  Option E: "Solid grasp of [topic] — you covered [key point]. [Speech-quality observation from analysis data]."
-  Option F: "[Direct observation about what they said first], which shows [assessment]. [Delivery note]."
-NEVER start two answers with the same opener. Quote or paraphrase what the candidate ACTUALLY SAID — make it feel personal, not generic.
+**FEEDBACK STYLE:**
+- Sound like a real mentor — natural, conversational, genuinely invested in their growth
+- DO NOT quote their exact words in quotation marks — DESCRIBE what they discussed
+- Every piece of feedback must feel freshly written for THIS specific answer — NEVER formulaic
+- Reference SPECIFIC concepts from their answer, not vague praise
 
-**FEEDBACK rules (content + delivery):**
-- First, evaluate WHAT they said: concepts they got right, concepts they missed
-- Second, evaluate HOW they said it: filler words, hedging, structure, confidence — reference SPEECH QUALITY ANALYSIS data
-- MUST be unique to THIS answer — never write generic advice like "study more" or "mention keyword X"
-- If the candidate explained the concept correctly but used different words than the ideal answer, give them FULL credit
+**MANDATORY FORMAT — Every feedback MUST have EXACTLY these 3 labeled sections:**
 
-**IMPROVEMENT_POINTS rules (3 specific, actionable coaching tips):**
-- Mix CONTENT tips and DELIVERY tips (not all content or all delivery)
-- Content tips: name the exact concept they missed or misexplained, and what the correct explanation is
-- Delivery tips: call out a specific habit from the speech analysis (e.g., "You said 'I think' 3 times — replace with confident assertions")
-- Action-oriented: tell them WHAT TO DO, not just what was wrong
-- BAD: ["Study the topic more", "Include 'polymorphism' in your answer"]
-- GOOD: ["You said 'I think' twice — state facts confidently: replace 'I think closures...' with 'Closures work by...'", "Add a concrete example: describe a counter function to make the concept tangible", "Structure: define the term → explain how it works → give a real-world use case"]
+"What landed:" — Warmly acknowledge what they got right (2-3 sentences, mentor tone)
+- Name 2-3 specific concepts they ACTUALLY covered and explain WHY those matter
+- Weave concepts into a natural observation, don't just list them
+- Examples: "You clearly get the core idea here — your coverage of X and Y shows real hands-on understanding..."
+  "What stood out was how naturally you connected A to B — that's the practical thinking interviewers want to see..."
+  "The way you broke this down shows genuine familiarity — pulling in X and Y means you're thinking about this the right way..."
+
+"What's missing:" — Concept-focused, growth-framing coaching (1-2 sentences)
+- Identify 2-3 key CONCEPTS from the ideal answer they didn't cover — use specific technical concept names
+- Frame as growth opportunities: "Where I'd push you to grow next is..." NOT "You forgot to mention..."
+- If misconceptions exist, correct gently here: "One thing to revisit —..."
+- Examples: "The concepts worth building into this answer are X and Y — mastering these would take your response from good to truly interview-ready..."
+  "Where I'd push you to grow next is X and Y — these come up as follow-ups almost every time..."
+  "To level up this answer, focus on X — that's the depth that makes interviewers think 'this person gets it'..."
+
+"Delivery:" — One actionable communication observation tied to this question type (1 sentence)
+- Based on SPEECH QUALITY data (fillers, hedging, confidence, structure)
+- Include question-type-specific delivery advice (e.g., for comparison questions suggest side-by-side structure, for behavioral suggest STAR format, for concept questions suggest definition-first approach)
+- Be specific and fixable
+
+**VARIATION RULES — CRITICAL (every question MUST feel freshly written):**
+- NEVER start "What landed:" the same way for any two questions — vary openers completely
+- NEVER start "What's missing:" the same way for any two questions — rotate approaches
+- Mix sentence structures, lengths, and rhythms across questions
+- Sometimes be brief and punchy, sometimes more detailed and conversational
+
+**IMPROVEMENT_POINTS rules (4-5 specific, actionable coaching tips — each MUST be specific to THIS question):**
+- At least 2 tips MUST be specific to the question's TOPIC (e.g., for auth questions: "Practice explaining the JWT flow in 3 steps: creation, transmission, verification")
+- At least 1 tip about HOW to structure/present THIS TYPE of answer
+- At least 1 tip about delivery, communication technique, or interview strategy
+- Each tip should reference something from their actual answer or a specific concept they should study
+- NEVER give generic advice like "study more" or "add more details" — always say WHAT and HOW
+
+GREAT improvement points (topic-specific, actionable):
+  - "For authentication questions, practice explaining the full JWT lifecycle: creation with claims, transmission via Authorization headers, and server-side verification — this three-step walkthrough is what interviewers want to hear."
+  - "You mentioned API keys but didn't contrast them with token-based auth — prepare a quick mental comparison (security level, use case, stateless vs stateful) for follow-up questions."
+  - "Your answer covered the 'what' well but missed the 'why' — for each scaling approach you mention, add one sentence about WHEN you'd choose it and what tradeoffs you're accepting."
+  - "The concepts of fault isolation and independent deployment were missing — these are the top two selling points interviewers expect in a microservices answer."
+  - "Try the Problem → Solution → Tradeoff framework for this type of question — it shows you think like an architect, not just a developer."
+  - "Consider pausing for one second before answering to mentally organize your points — even that brief pause prevents filler words and produces a more structured response."
+
+BAD improvement points (NEVER DO THIS):
+  - "Study the topic more" (no specific direction)
+  - "Include more details" (what details?)
+  - "Mention polymorphism" (just listing missing words)
+  - "Structure your answer better" (no actionable advice)
 
 **OUTPUT — ONLY this JSON, no markdown:**
-{"knowledge": <0-10>, "relevance": <0-10>, "clarity": <0-10>, "confidence": <0-10>, "feedback": "<2-3 sentences with a VARIED opener, covering content accuracy AND delivery quality, referencing what the candidate actually said>", "improvement_points": ["<specific, actionable content or delivery tip for THIS answer>", "<another specific tip with what to say/do>", "<another specific tip>"], "ideal_answer": "<expert model answer in 2-4 sentences>"}
+{"knowledge": <0-10>, "relevance": <0-10>, "clarity": <0-10>, "confidence": <0-10>, "feedback": "What landed: <warm mentor-tone acknowledgment of 2-3 specific concepts they covered, explaining why those matter — 2-3 sentences> What's missing: <coaching-tone identification of 2-3 gaps framed as growth opportunities, gentle corrections if needed — 1-2 sentences> Delivery: <one actionable observation about communication quality>", "improvement_points": ["<topic-specific tip about a concept they should study deeper for THIS question>", "<actionable strategy for structuring THIS TYPE of answer>", "<specific gap from their answer with concrete advice on how to fill it>", "<delivery or communication technique relevant to this answer>", "<optional 5th: advanced topic insight or interview technique specific to this domain>"], "ideal_answer": "<expert model answer in 2-4 sentences>"}
 
-REMINDER: Non-answers = all 0. Correct answers = 7-10. Use varied feedback openers every time.
+REMINDER: Non-answers = all 0. Correct answers = 7-10. Be encouraging AND truthful — find the real strengths, address the real gaps, and always leave them feeling motivated to improve.
 """
         return prompt
 
@@ -530,7 +708,8 @@ REMINDER: Non-answers = all 0. Correct answers = 7-10. Use varied feedback opene
             for phrase in self._REFUSAL_PHRASES:
                 if phrase in lower:
                     without_refusal = lower.replace(phrase, '').strip()
-                    remaining_words = [w for w in without_refusal.split() if len(w) > 2]
+                    remaining_words = [
+                        w for w in without_refusal.split() if len(w) > 2]
                     if len(remaining_words) < 8:
                         # Mostly a refusal + very little real content
                         return 'refusal'
@@ -573,14 +752,196 @@ REMINDER: Non-answers = all 0. Correct answers = 7-10. Use varied feedback opene
 
     # ── FALLBACK WHEN AI IS UNAVAILABLE ─────────────────────────────────────
 
+    # Fuzzy matching map for common speech-to-text garbling of technical terms
+    _SPEECH_CORRECTIONS = {
+        # ORM / Database
+        'rational': 'relational', 'relational': 'relational',
+        'mapping': 'mapping', 'orm': 'orm',
+        'sequel': 'sql', 'sequel': 'sql', 'my sequel': 'mysql',
+        'post gres': 'postgresql', 'postgres': 'postgresql',
+        'mongo': 'mongodb', 'redis': 'redis',
+        'no sequel': 'nosql', 'nosql': 'nosql',
+        'boil plate': 'boilerplate', 'boilerplate': 'boilerplate',
+        'sequel eyes': 'sequelize', 'sequelize': 'sequelize',
+        'equalise': 'sequelize', 'equalize': 'sequelize',
+        'hibernate': 'hibernate', 'prisma': 'prisma',
+        'alchemy': 'sqlalchemy', 'sql alchemy': 'sqlalchemy',
+        # Auth
+        'authentication': 'authentication', 'authorization': 'authorization',
+        'appendication': 'authentication', 'verify': 'verify',
+        'otherisation': 'authorization', 'authorisation': 'authorization',
+        'jwt': 'jwt', 'oauth': 'oauth', 'token': 'token',
+        'permissions': 'permissions', 'login': 'login',
+        # Architecture patterns
+        'strangler': 'strangler', 'fig': 'fig',
+        'bulkhead': 'bulkhead', 'bulk head': 'bulkhead',
+        'circuit breaker': 'circuit breaker',
+        'microservices': 'microservices', 'monolith': 'monolith',
+        'monograph': 'monolith',
+        # General tech
+        'api': 'api', 'rest': 'rest', 'graphql': 'graphql',
+        'database': 'database', 'server': 'server',
+        'endpoint': 'endpoint', 'middleware': 'middleware',
+        'deployment': 'deployment', 'docker': 'docker',
+        'kubernetes': 'kubernetes', 'container': 'container',
+        'cache': 'cache', 'caching': 'caching',
+        'scalability': 'scalability', 'load balancer': 'load balancer',
+        'sharding': 'sharding', 'replication': 'replication',
+        'tolerance': 'fault tolerance', 'fault tolerance': 'fault tolerance',
+        'overloads': 'overloads', 'isolate': 'isolate',
+        'compartments': 'compartments', 'resources': 'resources',
+        'connection': 'connection', 'pool': 'pool',
+        # Frontend
+        'virtual dom': 'virtual dom', 'react': 'react',
+        'component': 'component', 'hooks': 'hooks',
+        'state': 'state', 'props': 'props',
+        'javascript': 'javascript', 'typescript': 'typescript',
+        'closure': 'closure', 'klosure': 'closure',
+        'polymorphism': 'polymorphism', 'polly morphism': 'polymorphism',
+        'encapsulation': 'encapsulation', 'and capsulation': 'encapsulation',
+        'inheritance': 'inheritance', 'in heritance': 'inheritance',
+        'abstraction': 'abstraction',
+        # System design
+        'legacy': 'legacy', 'migration': 'migration', 'migrate': 'migrate',
+        'gradually': 'gradually', 'incrementally': 'incrementally',
+        'replace': 'replace', 'routing': 'routing',
+        'stability': 'stability', 'availability': 'availability',
+        'consistency': 'consistency', 'partition': 'partition',
+    }
+
+    def _normalize_speech_text(self, text: str) -> str:
+        """Apply speech-to-text corrections to normalize garbled technical terms."""
+        lower = text.lower()
+        # Apply multi-word corrections first (longer matches first)
+        sorted_corrections = sorted(self._SPEECH_CORRECTIONS.items(),
+                                    key=lambda x: len(x[0]), reverse=True)
+        for garbled, correct in sorted_corrections:
+            if garbled in lower:
+                lower = lower.replace(garbled, correct)
+        return lower
+
+    def _fuzzy_keyword_match(self, answer_word: str, keyword: str) -> bool:
+        """Check if an answer word is a fuzzy match for a keyword.
+        Handles speech-to-text garbling by checking:
+        - Exact match
+        - Substring containment (one contains the other)
+        - First 4+ chars match (prefix match)
+        - Edit distance ≤ 2 for short words
+        """
+        if not answer_word or not keyword:
+            return False
+        a = answer_word.lower().strip('.,!?;:')
+        k = keyword.lower().strip('.,!?;:')
+        if len(a) < 2 or len(k) < 2:
+            return False
+        # Exact match
+        if a == k:
+            return True
+        # One contains the other
+        if len(a) >= 4 and len(k) >= 4:
+            if a in k or k in a:
+                return True
+        # Prefix match (first 4+ characters)
+        prefix_len = min(4, min(len(a), len(k)))
+        if prefix_len >= 3 and a[:prefix_len] == k[:prefix_len]:
+            # Also check they're similar length (within 3 chars)
+            if abs(len(a) - len(k)) <= 3:
+                return True
+        return False
+
+    def _detect_question_concepts(self, question: str, answer: str) -> float:
+        """Detect if the answer addresses the core concepts asked about in the question.
+        Returns a bonus score (0.0 to 0.4) based on concept coverage."""
+        q_lower = question.lower()
+        a_lower = answer.lower()
+        bonus = 0.0
+
+        # Map question patterns to concept-detection patterns in the answer
+        concept_checks = [
+            # ORM questions
+            ({'orm', 'object relational', 'object-relational'},
+             {'database', 'object', 'table', 'class', 'map', 'query', 'sql'}),
+            # Auth questions
+            ({'authentication', 'authorization', 'auth'},
+             {'login', 'verify', 'access', 'permission', 'token', 'jwt', 'password', 'role', 'user'}),
+            # Strangler fig
+            ({'strangler'},
+             {'legacy', 'replace', 'old system', 'new system', 'migrate', 'gradually', 'incrementally', 'route', 'routing'}),
+            # Bulkhead
+            ({'bulkhead'},
+             {'isolate', 'resource', 'service', 'failure', 'prevent', 'pool', 'compartment', 'separate'}),
+            # let/const/var
+            ({'let', 'const', 'var'},
+             {'scope', 'block', 'function', 'hoisting', 'reassign', 'immutable', 'declaration'}),
+            # Virtual DOM
+            ({'virtual dom'},
+             {'memory', 'diff', 'render', 'update', 'real dom', 'reconciliation', 'performance', 'comparison'}),
+            # Closures
+            ({'closure'},
+             {'function', 'scope', 'variable', 'outer', 'inner', 'access', 'return', 'lexical'}),
+            # REST API
+            ({'rest', 'restful', 'api'},
+             {'http', 'get', 'post', 'put', 'delete', 'endpoint', 'resource', 'url', 'status'}),
+            # Database indexing
+            ({'index', 'indexing'},
+             {'lookup', 'query', 'performance', 'column', 'search', 'b-tree', 'fast', 'scan'}),
+            # Microservices
+            ({'microservice'},
+             {'service', 'independent', 'deploy', 'api', 'scale', 'separate', 'communicate', 'database'}),
+            # ACID
+            ({'acid'},
+             {'atomic', 'consistent', 'isolation', 'durable', 'transaction', 'rollback'}),
+            # CAP theorem
+            ({'cap theorem', 'cap'},
+             {'consistency', 'availability', 'partition', 'distributed', 'tolerance'}),
+            # SQL vs NoSQL
+            ({'sql', 'nosql'},
+             {'relational', 'table', 'schema', 'document', 'flexible', 'scale', 'query'}),
+            # CI/CD
+            ({'ci/cd', 'cicd', 'ci cd'},
+             {'pipeline', 'deploy', 'test', 'build', 'automate', 'integration', 'delivery'}),
+            # Docker
+            ({'docker', 'container'},
+             {'image', 'container', 'deploy', 'environment', 'portable', 'isolate', 'run'}),
+            # Event loop
+            ({'event loop'},
+             {'callback', 'queue', 'stack', 'async', 'single thread', 'non-blocking'}),
+            # Caching
+            ({'cache', 'caching'},
+             {'store', 'fast', 'memory', 'redis', 'performance', 'hit', 'miss', 'expire'}),
+        ]
+
+        for q_concepts, a_concepts in concept_checks:
+            # Check if the question is about this concept
+            if any(c in q_lower for c in q_concepts):
+                # Count how many answer concepts are present
+                matches = sum(1 for c in a_concepts if c in a_lower)
+                if matches >= 4:
+                    bonus = max(bonus, 0.35)
+                elif matches >= 3:
+                    bonus = max(bonus, 0.28)
+                elif matches >= 2:
+                    bonus = max(bonus, 0.20)
+                elif matches >= 1:
+                    bonus = max(bonus, 0.10)
+
+        return bonus
+
     def _create_fallback_response(
         self, user_answer: str, question: str, ideal_answer: str = None,
         speech_metrics: dict = None
     ) -> Dict:
         """
-        Honest fallback when LLM is unavailable.
-        Instead of fake keyword-based scores, gives delivery-based feedback
-        from speech metrics and acknowledges AI scoring is unavailable.
+        Smart fallback when LLM is unavailable.
+        Uses local NLP (cosine similarity + keyword overlap + speech metrics)
+        PLUS speech-aware fuzzy matching and concept detection
+        to produce a FAIR score for speech-to-text transcripts.
+
+        Scoring is calibrated so that:
+        - Excellent answers with good delivery => 85-95
+        - Good answers => 70-84
+        - Fair answers => 45-69
+        - Poor/vague answers => 25-44
         """
         cleaned = user_answer.strip() if user_answer else ""
         words = cleaned.lower().split()
@@ -596,112 +957,545 @@ REMINDER: Non-answers = all 0. Correct answers = 7-10. Use varied feedback opene
                 "answer_type": "empty"
             }
 
-        # Build delivery-based feedback from speech metrics
-        feedback_parts = []
-        improvement_tips = []
+        # ── NORMALIZE speech-to-text garbling before scoring ──
+        normalized_answer = self._normalize_speech_text(cleaned)
+        normalized_ideal = self._normalize_speech_text(
+            ideal_answer) if ideal_answer else None
 
-        feedback_parts.append(
-            "AI-powered content scoring is temporarily unavailable. "
-            "Your answer was recorded. Here is delivery feedback based on your speech patterns:"
-        )
+        # ── LOCAL CONTENT SCORING ──
+        content_score = 0.0
+        meaningful = [
+            w for w in words if w not in self._FILLER_WORDS and len(w) > 2]
+        meaningful_count = len(meaningful)
+
+        similarity = 0.0
+        keyword_overlap = 0.0
+        fuzzy_bonus_val = 0.0
+
+        if normalized_ideal and len(normalized_ideal.strip()) > 5:
+            try:
+                # Use normalized texts for similarity (fixes garbled term matching)
+                similarity = self._compute_cosine_similarity(
+                    normalized_answer, normalized_ideal
+                )
+                keyword_overlap = self._compute_keyword_overlap(
+                    normalized_answer, question.lower(), normalized_ideal
+                )
+                fuzzy_bonus_val = self._compute_fuzzy_overlap(
+                    normalized_answer, question.lower(), normalized_ideal
+                )
+                # Weighted blend
+                content_score = (
+                    similarity * 0.40 + keyword_overlap * 0.35 + fuzzy_bonus_val * 0.25)
+            except Exception:
+                content_score = 0.35  # Safe default on error
+        else:
+            # No ideal answer — score based on answer substance
+            if meaningful_count >= 25:
+                content_score = 0.65
+            elif meaningful_count >= 15:
+                content_score = 0.55
+            elif meaningful_count >= 10:
+                content_score = 0.45
+            elif meaningful_count >= 5:
+                content_score = 0.35
+            else:
+                content_score = 0.2
+
+        # ── CONCEPT DETECTION BONUS ──
+        concept_bonus = self._detect_question_concepts(question, cleaned)
+        content_score = min(1.0, content_score + concept_bonus)
+
+        # ── ANSWER SUBSTANCE BONUS ──
+        # Longer meaningful answers deserve higher scores even if exact word matching is low
+        if meaningful_count >= 40:
+            content_score = max(content_score, 0.72)
+        elif meaningful_count >= 30:
+            content_score = max(content_score, 0.65)
+        elif meaningful_count >= 20:
+            content_score = max(content_score, 0.55)
+        elif meaningful_count >= 12:
+            content_score = max(content_score, 0.45)
+
+        # ── HIGH-SIMILARITY BOOST ──
+        # If cosine similarity or keyword overlap is very high, the answer is clearly correct
+        if similarity >= 0.6 and keyword_overlap >= 0.5:
+            content_score = max(content_score, 0.85)
+        elif similarity >= 0.5 and keyword_overlap >= 0.4:
+            content_score = max(content_score, 0.78)
+        elif similarity >= 0.4 and keyword_overlap >= 0.3:
+            content_score = max(content_score, 0.70)
+        elif similarity >= 0.3 or keyword_overlap >= 0.4:
+            content_score = max(content_score, 0.60)
+
+        # ── DELIVERY SCORING (from speech metrics) ──
+        delivery_score = 0.7  # Default: decent delivery
+        has_examples = False
+        has_structure = False
+        has_confidence_markers = False
+        filler_count = 0
+        hedge_count = 0
 
         if speech_metrics:
             fillers = speech_metrics.get('filler_analysis', {})
             hedging = speech_metrics.get('hedging_analysis', {})
             structure = speech_metrics.get('structure_analysis', {})
             examples = speech_metrics.get('example_usage', {})
-            repetition = speech_metrics.get('repetition_analysis', {})
+            confidence_info = speech_metrics.get('confidence_analysis', {})
 
-            # Filler word feedback
-            if fillers.get('count', 0) > 2:
-                filler_list = ', '.join(
-                    f'"{k}"' for k in list(fillers.get('details', {}).keys())[:3]
-                )
-                feedback_parts.append(
-                    f"You used {fillers['count']} filler words ({filler_list}). "
-                    "Try replacing these with confident pauses."
-                )
-                improvement_tips.append(
-                    f"Reduce filler words — you used {filler_list}. "
-                    "Practice pausing silently instead of saying 'um' or 'basically'."
-                )
-            elif fillers.get('count', 0) == 0:
-                feedback_parts.append("Clean delivery with no filler words.")
+            filler_count = fillers.get('count', 0)
+            hedge_count = hedging.get('count', 0)
+            has_structure_issue = bool(structure.get('issue'))
+            has_examples = examples.get('used_examples', False)
+            has_structure = structure.get('has_structure', False)
+            has_confidence_markers = len(
+                confidence_info.get('markers_found', [])) >= 2
 
-            # Hedging feedback
-            if hedging.get('count', 0) > 0:
-                hedge_list = ', '.join(
-                    f'"{p}"' for p in hedging.get('phrases_found', [])[:3]
-                )
-                feedback_parts.append(
-                    f"You used hedging language ({hedge_list}). "
-                    "State your knowledge as facts, not guesses."
-                )
-                improvement_tips.append(
-                    f"Remove uncertainty phrases like {hedge_list}. "
-                    "Say 'X works by...' instead of 'I think X might work by...'"
-                )
+            # Penalties for delivery issues
+            if filler_count > 5:
+                delivery_score -= 0.12
+            elif filler_count > 2:
+                delivery_score -= 0.06
+            if hedge_count > 3:
+                delivery_score -= 0.08
+            elif hedge_count > 0:
+                delivery_score -= 0.03
+            if has_structure_issue:
+                delivery_score -= 0.04
 
-            # Structure feedback
-            if structure.get('issue'):
-                issue = structure['issue']
-                if issue == 'single_run_on_sentence':
-                    feedback_parts.append(
-                        "Your answer was one long run-on sentence. "
-                        "Break it into clear points."
-                    )
-                    improvement_tips.append(
-                        "Structure your answer: define the concept, explain how it works, give an example."
-                    )
-                elif issue == 'very_choppy':
-                    feedback_parts.append(
-                        "Your answer had many very short sentences. "
-                        "Try connecting ideas with transitions."
-                    )
+            # BONUSES for good delivery (critical for reaching 90+)
+            if filler_count == 0:
+                delivery_score += 0.10  # Clean speech
+            if has_examples:
+                delivery_score += 0.08  # Used concrete examples
+            if has_structure:
+                delivery_score += 0.08  # Structured answer
+            if has_confidence_markers:
+                delivery_score += 0.06  # Confident language
+            if structure.get('sentence_count', 0) >= 3 and not has_structure_issue:
+                delivery_score += 0.05  # Multi-sentence, well-formed
 
-            # Example usage feedback
-            if not examples.get('used_examples', False):
-                improvement_tips.append(
-                    "Add a concrete example or real-world scenario to make your answer memorable."
-                )
+            delivery_score = max(0.3, min(1.0, delivery_score))
 
-            # Repetition feedback
-            overused = repetition.get('overused_words', {})
-            if overused:
-                rep_list = ', '.join(
-                    f'"{k}" ({v}x)' for k, v in list(overused.items())[:3]
-                )
-                improvement_tips.append(
-                    f"You repeated: {rep_list}. Vary your language for a more polished delivery."
-                )
+        # ── COMBINED SCORE ──
+        # 70% content + 30% delivery
+        raw_score = content_score * 0.70 + delivery_score * 0.30
+        # Scale to 0-100, with floor at 25 (they gave a real answer) and cap at 95
+        # (reserve 96-100 for LLM-evaluated exceptional answers only)
+        score = int(round(raw_score * 100))
+        score = max(25, min(95, score))
 
-        # Ensure we have at least some improvement tips
-        if not improvement_tips:
-            improvement_tips = [
-                "Review the ideal answer and compare it with what you said.",
-                "Practice structuring answers: concept → explanation → example.",
-                "Try to sound confident — avoid hedging phrases like 'I think' or 'maybe'."
+        # ── Compute rubric breakdown (0-10 scale) ──
+        # Knowledge and relevance can differ — knowledge is content depth, relevance is question-matching
+        knowledge_raw = min(10, max(1, round(content_score * 10)))
+        # Relevance gets a slight boost if keyword overlap is high
+        relevance_factor = min(1.0, content_score + (keyword_overlap * 0.15))
+        relevance_raw = min(10, max(1, round(relevance_factor * 10)))
+        clarity_raw = min(10, max(1, round(delivery_score * 10)))
+        confidence_raw = min(10, max(1, round(delivery_score * 9.5)))
+
+        status = (
+            "excellent" if score >= 80 else
+            "good" if score >= 60 else
+            "fair" if score >= 40 else
+            "poor"
+        )
+
+        # ── Build FEEDBACK WITH ANSWER ANALYSIS ──
+        feedback_parts = []
+        improvement_tips = []
+
+        import random
+
+        # ── Helper: clean keyword extraction (filters punctuation and junk) ──
+        def _clean_keywords(text, min_len=4):
+            if not text:
+                return set()
+            clean = re.sub(r'[^a-z0-9\s]', ' ', text.lower())
+            _skip = {'used', 'using', 'example', 'best', 'need', 'make', 'work',
+                     'data', 'type', 'each', 'more', 'many', 'other', 'first',
+                     'second', 'third', 'same', 'different', 'another', 'only',
+                     'from', 'that', 'this', 'with', 'into', 'than', 'then',
+                     'when', 'where', 'which', 'about', 'between', 'through',
+                     'after', 'before', 'during', 'without', 'within', 'across',
+                     'common', 'based', 'over', 'under', 'because', 'such',
+                     'most', 'some', 'like', 'just', 'also', 'well', 'very'}
+            return set(
+                w for w in clean.split()
+                if len(w) >= min_len
+                and w not in self._FILLER_WORDS
+                and w not in _skip
+                and not w.isdigit()
+            )
+
+        # ── Extract what user covered vs what's missing ──
+        user_kw = _clean_keywords(normalized_answer)
+        ideal_kw = _clean_keywords(
+            normalized_ideal) if normalized_ideal else set()
+        question_kw = _clean_keywords(question.lower())
+
+        # Use question concept map for accurate, question-specific feedback
+        try:
+            from services.question_concepts import get_question_concepts
+            _q_concepts = get_question_concepts(question)
+        except Exception:
+            _q_concepts = []
+
+        if _q_concepts:
+            _ans_lower = normalized_answer.lower()
+            matched_concepts = []
+            missing_concepts = []
+            for _c in _q_concepts:
+                _terms = [w for w in _c.lower().split() if len(w) > 3]
+                if not _terms:
+                    _terms = _c.lower().split()
+                _hits = sum(1 for w in _terms if w in _ans_lower)
+                if _hits >= max(1, len(_terms) // 2):
+                    matched_concepts.append(_c)
+                else:
+                    missing_concepts.append(_c)
+        else:
+            matched_concepts = sorted(user_kw & (ideal_kw | question_kw))
+            missing_concepts = sorted(ideal_kw - user_kw) if ideal_kw else []
+
+        # ── What Landed Phrases (concept-focused, mentor tone) ──
+        landed_phrases = []
+        if len(matched_concepts) >= 3:
+            sample = matched_concepts[:3]
+            landed_phrases = [
+                f"You clearly get the core idea here — your coverage of {', '.join(sample)} shows you've actually worked with these concepts, not just read about them.",
+                f"What stood out was how naturally you brought in {', '.join(sample)} — these are exactly what an interviewer wants to hear, and you nailed them.",
+                f"The way you connected {', '.join(sample)} shows real hands-on understanding. That's the kind of practical knowledge that separates strong candidates.",
+                f"You hit the important marks here — {', '.join(sample)} are the building blocks, and the fact that you reached for them instinctively is a great sign.",
+                f"This shows genuine familiarity — pulling in {', '.join(sample)} means you're thinking about this the right way, not just memorizing definitions.",
+            ]
+        elif len(matched_concepts) >= 1:
+            sample = matched_concepts[:2]
+            landed_phrases = [
+                f"You're on the right track — identifying {', '.join(sample)} shows you've got the foundation. That's a solid starting point to build from.",
+                f"The fact that you reached for {', '.join(sample)} tells me you understand the basics here. {'These are' if len(sample) > 1 else 'That is'} exactly where you want to start.",
+                f"Good instinct going to {', '.join(sample)} first — that shows the kind of fundamentals that anchor a strong answer.",
             ]
 
-        feedback = ' '.join(feedback_parts)
+        # ── What's Missing Phrases (concept-focused + growth-framing) ──
+        missing_phrases = []
+        if len(missing_concepts) >= 2:
+            sample = missing_concepts[:3]
+            missing_phrases = [
+                f"The concepts worth building into this answer are {', '.join(sample)} — mastering these would take your response from good to truly interview-ready.",
+                f"Where I'd push you to grow next is around {', '.join(sample)} — these are what separate a decent answer from one that really impresses.",
+                f"To level up this answer, focus on {', '.join(sample)} — once you've internalized these, you'll handle follow-up questions with ease.",
+                f"The depth an interviewer is looking for here includes {', '.join(sample)} — adding these to your toolkit makes this a standout answer.",
+                f"The growth area here is {', '.join(sample)} — these come up as follow-ups almost every time, and having them ready gives you a real edge.",
+            ]
+        elif len(missing_concepts) == 1:
+            missing_phrases = [
+                f"The one concept that would really complete this is {missing_concepts[0]} — it's the missing piece that ties everything together.",
+                f"To take this to the next level, work on {missing_concepts[0]} — once that's in your toolkit, this becomes a complete, confident answer.",
+            ]
 
-        # Give a moderate default score since we can't properly evaluate content
-        # This is honest — we acknowledge we can't score accurately
-        score = 50
-        status = "fair"
+        # ── Structure Comments ──
+        structure_phrases = []
+        if meaningful_count >= 25:
+            structure_phrases = [
+                "Your answer had good depth and covered multiple angles, which shows thorough thinking.",
+                "The breadth of your response demonstrates comprehensive thinking about this topic.",
+            ]
+        elif meaningful_count >= 15:
+            structure_phrases = [
+                "Your explanation was focused and relevant — adding another layer of detail would make it interview-ready.",
+                "You kept it tight and on-topic, which is good — a bit more elaboration would push this higher.",
+            ]
+        elif meaningful_count < 10:
+            structure_phrases = [
+                "The answer was quite brief — interviewers generally expect a bit more elaboration to gauge depth.",
+                "Try to expand beyond the headline points — even two more sentences would strengthen this significantly.",
+            ]
+
+        # ── Delivery Comments (many variants) ──
+        delivery_phrases = []
+        if speech_metrics:
+            fillers = speech_metrics.get('filler_analysis', {})
+            hedging = speech_metrics.get('hedging_analysis', {})
+            structure_info = speech_metrics.get('structure_analysis', {})
+            examples_info = speech_metrics.get('example_usage', {})
+            confidence_info = speech_metrics.get('confidence_analysis', {})
+            repetition = speech_metrics.get('repetition_analysis', {})
+
+            if filler_count == 0 and has_confidence_markers:
+                delivery_phrases = [
+                    "Your delivery was polished and confident — no filler words, giving you a real professional edge.",
+                    "On the communication side, your clean speaking style with no fillers made this feel authoritative.",
+                    "Zero filler words and steady confidence throughout — that kind of delivery really impresses.",
+                    "The way you spoke was clear and direct, which elevated the whole response.",
+                ]
+            elif filler_count == 0:
+                delivery_phrases = [
+                    "No filler words in your delivery, which keeps the answer sounding sharp and intentional.",
+                    "Clean delivery with no filler pauses — that kind of fluency builds interviewer confidence.",
+                    "Your speech was crisp and focused, which is a real strength in interview settings.",
+                ]
+            elif filler_count <= 2:
+                delivery_phrases = [
+                    "Your delivery was mostly smooth with just a couple of brief filler moments — very minor and easy to polish.",
+                    "A couple of small filler moments, but overall your speaking pace was natural and comfortable.",
+                ]
+            elif filler_count <= 5:
+                delivery_phrases = [
+                    f"There were about {filler_count} filler moments — try embracing brief pauses instead, which sound more confident.",
+                    f"Around {filler_count} filler words crept in — replacing these with short silent pauses would elevate your delivery.",
+                ]
+            else:
+                delivery_phrases = [
+                    f"About {filler_count} filler words came through — focus on slowing down slightly and allowing natural pauses.",
+                    f"The {filler_count} filler moments diluted solid content — this is very fixable with practice.",
+                ]
+
+            if has_examples:
+                delivery_phrases.append(random.choice([
+                    "Using a concrete example was smart — it made your explanation tangible and memorable.",
+                    "The real-world example you included added practical credibility to your answer.",
+                ]))
+
+            # Delivery-based improvement tips
+            if filler_count > 2:
+                improvement_tips.append(
+                    "Practice replacing filler sounds with brief silent pauses — even a one-second pause sounds intentional and gives you time to think clearly."
+                )
+            if hedge_count > 0:
+                improvement_tips.append(random.choice([
+                    "Work on replacing hedging language ('I think', 'maybe', 'probably') with direct statements — state what you know, then add nuance.",
+                    "Try opening with a clear, definitive statement before adding qualifications — it sets a much stronger first impression.",
+                ]))
+            if structure_info.get('issue') == 'single_run_on_sentence':
+                improvement_tips.append(
+                    "Break your answer into clear segments — try pausing briefly between main points to give the interviewer time to absorb each one."
+                )
+            elif structure_info.get('issue') == 'very_choppy':
+                improvement_tips.append(
+                    "Connect your short points with transitional phrases like 'building on that' or 'this connects to' — it creates a narrative flow."
+                )
+
+            overused = repetition.get('overused_words', {})
+            if overused:
+                improvement_tips.append(
+                    "Vary your vocabulary more — when you notice yourself repeating a word, switch to a synonym or rephrase the idea."
+                )
+
+        # ── ASSEMBLE STRUCTURED FEEDBACK (What landed / What's missing / Delivery) ──
+
+        # ── Build "What landed:" section ──
+        landed_text = ""
+        if content_score >= 0.78:
+            if landed_phrases:
+                landed_text = random.choice(landed_phrases)
+            else:
+                landed_text = random.choice([
+                    "This was a really strong take — your answer showed deep practical knowledge of the core concepts.",
+                    "You tackled this with a lot of confidence and clarity — impressive command of the material.",
+                    "Your understanding here is clearly well-developed — this response hit the marks interviewers look for.",
+                ])
+            if structure_phrases:
+                landed_text += " " + random.choice(structure_phrases)
+        elif content_score >= 0.60:
+            if landed_phrases:
+                landed_text = random.choice(landed_phrases)
+            else:
+                landed_text = random.choice([
+                    "There's real understanding here — you're clearly thinking about this the right way.",
+                    "Your approach shows genuine engagement with these concepts, which is a strong foundation.",
+                    "This had the right core ideas and was heading in a strong direction.",
+                ])
+            if structure_phrases:
+                landed_text += " " + random.choice(structure_phrases)
+        elif content_score >= 0.45:
+            if landed_phrases:
+                landed_text = random.choice(landed_phrases)
+            else:
+                landed_text = random.choice([
+                    "You've got some of the right pieces here, which is a genuinely good starting point to build from.",
+                    "There are seeds of the right ideas in what you said — building on what you know is the fastest path forward.",
+                    "Your instinct about this topic is heading in the right direction, and that counts for a lot.",
+                ])
+        else:
+            if landed_phrases:
+                landed_text = random.choice(landed_phrases)
+            else:
+                landed_text = random.choice([
+                    "It's great that you gave this a shot — that willingness to try matters more than you'd think.",
+                    "This is a tricky topic, and the fact that you engaged with it puts you ahead of people who'd just say 'I don't know.'",
+                    "Don't be discouraged here — every strong interviewer started by struggling with questions exactly like this.",
+                    "The effort you put into this answer counts — with a bit of focused study, this becomes very doable.",
+                ])
+
+        # ── Build "What's missing:" section ──
+        missing_text = ""
+        if missing_phrases:
+            missing_text = random.choice(missing_phrases)
+        elif content_score < 0.45 and normalized_ideal:
+            missing_text = "Review the ideal answer below — studying its structure will give you a clear roadmap of what to cover next time."
+        elif content_score < 0.60:
+            missing_text = "Adding more specific technical concepts and connecting them to practical scenarios would strengthen this significantly."
+
+        # ── Build "Delivery:" section ──
+        delivery_text = ""
+        if delivery_phrases:
+            delivery_text = random.choice(delivery_phrases[:3] if len(delivery_phrases) >= 3 else delivery_phrases)
+
+        # ── Add question-type-aware delivery advice ──
+        if delivery_text:
+            _q_lower = question.lower()
+            if any(kw in _q_lower for kw in ['explain', 'what is', 'what are', 'describe']):
+                delivery_text += " For concept-explanation questions like this, leading with a crisp one-sentence definition before elaborating helps the interviewer anchor your answer."
+            elif any(kw in _q_lower for kw in ['difference', 'compare', 'versus', 'vs']):
+                delivery_text += " For comparison questions, a structured side-by-side contrast with clear categories makes your answer much easier to follow."
+            elif any(kw in _q_lower for kw in ['tell me about', 'describe a time', 'give an example']):
+                delivery_text += " For behavioral questions, the STAR format (Situation, Task, Action, Result) gives your story a clear, memorable arc."
+            elif any(kw in _q_lower for kw in ['design', 'architect', 'build']):
+                delivery_text += " For design questions, walking through requirements then components then data flow then tradeoffs shows the structured thinking interviewers value."
+            elif any(kw in _q_lower for kw in ['how do you', 'how would you', 'how does']):
+                delivery_text += " For process-oriented questions, describing your approach step by step with reasoning behind each choice demonstrates practical experience."
+            elif any(kw in _q_lower for kw in ['optimize', 'improve', 'performance']):
+                delivery_text += " For optimization questions, leading with 'profile first, then optimize' shows engineering maturity before diving into specific techniques."
+            elif any(kw in _q_lower for kw in ['when', 'why', 'should']):
+                delivery_text += " For decision-making questions, showing you can reason about tradeoffs — not just list options — is what separates strong answers."
+
+        # ── Combine into structured feedback ──
+        if landed_text:
+            feedback_parts.append(f"What landed: {landed_text}")
+        if missing_text:
+            feedback_parts.append(f"What's missing: {missing_text}")
+        if delivery_text:
+            feedback_parts.append(f"Delivery: {delivery_text}")
+
+        if not feedback_parts:
+            feedback_parts.append("Your response has been analyzed — review the scores and improvement tips below for specific guidance.")
+
+        # ── GENERATE TOPIC-SPECIFIC ACTION POINTS ──
+        q_lower = question.lower()
+        topic_tips = []
+
+        if any(kw in q_lower for kw in ['authentication', 'auth', 'security', 'jwt', 'oauth']):
+            topic_tips = [
+                "For auth questions, practice drawing the complete flow: credentials submitted → server validates → token issued → client stores → subsequent requests include token → server verifies.",
+                "Prepare a mental comparison of JWT vs Session vs OAuth vs API Keys — covering when each is appropriate separates good from great answers.",
+                "Security topics often have follow-ups about vulnerabilities — think about CSRF, XSS, token theft and how each auth method handles them.",
+                "Practice explaining the difference between authentication (who are you?) and authorization (what can you do?) — interviewers love candidates who distinguish these cleanly.",
+            ]
+        elif any(kw in q_lower for kw in ['rest', 'api', 'endpoint', 'http']):
+            topic_tips = [
+                "For REST API questions, anchor your answer in core constraints: stateless communication, resource-based URLs, proper HTTP methods, and meaningful status codes.",
+                "Practice listing best practices in categories — URL design, HTTP methods, error handling, versioning, security — this shows organized thinking.",
+                "Think about real decisions: when would you use query params vs path params? When is pagination important? These details signal hands-on experience.",
+                "Mention idempotency for PUT/DELETE and non-idempotency for POST — this subtle distinction impresses interviewers who probe deeper.",
+            ]
+        elif any(kw in q_lower for kw in ['microservice', 'monolith', 'distributed']):
+            topic_tips = [
+                "Microservices questions almost always expect both pros AND cons — practice a balanced comparison covering at least 3 of each.",
+                "Mention specific challenges: data consistency across services, distributed transactions, service discovery, and inter-service communication patterns.",
+                "Tie your answer to real scenarios — 'When your team grows to 50+ engineers...' or 'In an e-commerce system...' shows practical judgment.",
+                "Discuss the migration path from monolith to microservices — this shows you understand it's not a binary choice but a spectrum.",
+            ]
+        elif any(kw in q_lower for kw in ['scaling', 'horizontal', 'vertical', 'scale']):
+            topic_tips = [
+                "Always contrast clearly: horizontal (add more machines) vs vertical (upgrade one machine) with specific tradeoffs of cost, complexity, and failure modes.",
+                "Include practical considerations: load balancing, database sharding, caching layers, and when each scaling approach makes sense architecturally.",
+                "Mention that horizontal scaling handles single points of failure better, while vertical has simpler architecture — this tradeoff analysis shows depth.",
+                "Real-world examples help: 'Netflix scales horizontally across regions because...' makes your answer memorable and credible.",
+            ]
+        elif any(kw in q_lower for kw in ['database', 'sql', 'nosql', 'index', 'query']):
+            topic_tips = [
+                "Database questions benefit from concrete examples — mention specific databases (PostgreSQL, MongoDB, Redis) and when you'd choose each.",
+                "Practice explaining indexing with an analogy (like a book's index) then layer in B-tree details for technical depth.",
+                "Think about tradeoffs: consistency vs availability, read-heavy vs write-heavy workloads, normalized vs denormalized schemas.",
+                "Mention ACID properties for SQL and BASE properties for NoSQL — showing you understand both paradigms' guarantees is impressive.",
+            ]
+        elif any(kw in q_lower for kw in ['closure', 'scope', 'hoisting', 'javascript', 'js']):
+            topic_tips = [
+                "For JavaScript concept questions, walk through a simple mental code example step by step — this makes abstract concepts concrete.",
+                "Connect the concept to practical use cases: closures in event handlers, module patterns, or data privacy — shows applied understanding.",
+                "Practice explaining the 'why' behind the concept — why does JavaScript have closures? What problem do they solve? This shows deeper thinking.",
+                "Mention the relationship between closures and lexical scoping — candidates who connect these concepts stand out.",
+            ]
+        elif any(kw in q_lower for kw in ['react', 'component', 'virtual dom', 'hooks', 'state']):
+            topic_tips = [
+                "React questions often probe the rendering lifecycle — practice explaining when and why components re-render.",
+                "Connect theory to practice: explain the Virtual DOM by describing what happens when a user clicks a button and state changes.",
+                "Mention performance implications and optimizations (React.memo, useCallback, useMemo) to show depth beyond basics.",
+                "Discuss the component composition pattern vs inheritance — React's philosophy of 'composition over inheritance' is a key talking point.",
+            ]
+        elif any(kw in q_lower for kw in ['docker', 'container', 'kubernetes', 'deploy', 'ci/cd', 'cicd']):
+            topic_tips = [
+                "DevOps questions benefit from real workflow descriptions — walk through a deployment pipeline step by step.",
+                "Mention specific tools and how they connect: Docker for containerization, Kubernetes for orchestration, Jenkins/GitHub Actions for CI/CD.",
+                "Include the 'why' behind containerization — consistency across environments, isolation, portability — then give a concrete scenario.",
+                "Discuss the difference between containers and VMs — this fundamental distinction shows you understand the underlying technology.",
+            ]
+        elif any(kw in q_lower for kw in ['consistency', 'eventual', 'cap', 'acid', 'transaction']):
+            topic_tips = [
+                "For CAP/consistency questions, use a concrete example (e-commerce inventory, banking) to illustrate the tradeoffs vividly.",
+                "Practice explaining eventual consistency with a timeline: write happens → propagation delay → all nodes consistent — makes abstract concepts concrete.",
+                "Connect to real systems: why DynamoDB chose eventual consistency, how Cassandra handles it — this shows you've studied beyond theory.",
+                "Explain when strong consistency is worth the performance cost (financial transactions) vs when eventual is acceptable (social media feeds).",
+            ]
+        elif any(kw in q_lower for kw in ['cache', 'caching', 'redis', 'performance']):
+            topic_tips = [
+                "For caching questions, cover the key decisions: what to cache, cache invalidation strategies, and TTL policies — these show practical experience.",
+                "Mention cache-aside, write-through, and write-behind patterns — knowing the tradeoffs between these distinguishes senior candidates.",
+                "Discuss cache invalidation ('the two hard things in computer science') and strategies like TTL, event-driven, and versioned keys.",
+                "Connect caching to real architecture: CDN for static assets, Redis for session/data, browser cache for client-side — shows systems thinking.",
+            ]
+
+        # Generic fallback tips for topics not specifically matched
+        if not topic_tips:
+            topic_tips = [
+                "Practice structuring answers as Definition → How It Works → Example/Use Case — this three-part flow works for almost any technical question.",
+                "Before your next practice session, study the ideal answer and practice explaining it in your own words until it flows naturally.",
+                "Try recording yourself answering this question and compare to the ideal — self-review is one of the fastest ways to improve.",
+                "Think about the 'why' behind each concept you mention — interviewers are more impressed by understanding motivation than listing facts.",
+            ]
+
+        # Add topic-specific tips (avoid duplicates with delivery-based tips)
+        for tip in topic_tips:
+            if len(improvement_tips) < 5 and tip not in improvement_tips:
+                improvement_tips.append(tip)
+
+        # Fill to at least 4 tips with general communication/delivery tips
+        general_tips = [
+            "Practice opening with a confident one-sentence definition before diving into details — it anchors the interviewer immediately.",
+            "When you feel yourself trailing off, wrap up with a clear concluding statement that ties back to the question.",
+            "Try the 'teach it to a friend' technique: if you can explain a concept simply in conversation, you'll nail it in an interview.",
+            "Use signposting language ('There are three main aspects...', 'The key tradeoff is...') to give your answers professional structure.",
+            "Build confidence by leading with what you know for certain, then expanding — interviewers value honest conviction.",
+        ]
+        random.shuffle(general_tips)
+        for tip in general_tips:
+            if len(improvement_tips) < 4:
+                improvement_tips.append(tip)
+
+        if not has_examples and not any('example' in t.lower() for t in improvement_tips):
+            if len(improvement_tips) < 5:
+                improvement_tips.append(
+                    "Weave in a real-world scenario or quick example — it transforms abstract explanations into something interviewers visualize and remember."
+                )
+
+        feedback = ' '.join(feedback_parts)
 
         return {
             "score": score,
             "feedback": feedback,
             "status": status,
             "breakdown": {
-                "knowledge": 5, "relevance": 5, "clarity": 5, "confidence": 5,
-                "technical": 50, "grammar": 50, "accent": 50, "confidence_score": 50,
-                "technical_score": 50, "communication_score": 50,
-                "depth_score": 50
+                "knowledge": knowledge_raw, "relevance": relevance_raw,
+                "clarity": clarity_raw, "confidence": confidence_raw,
+                "technical": knowledge_raw * 10, "grammar": clarity_raw * 10,
+                "accent": relevance_raw * 10, "confidence_score": confidence_raw * 10,
+                "technical_score": knowledge_raw * 10,
+                "communication_score": clarity_raw * 10,
+                "depth_score": relevance_raw * 10
             },
             "improvement_points": improvement_tips[:4],
-            "answer_type": "ai_unavailable"
+            "answer_type": "local_analysis"
         }
 
     def _compute_cosine_similarity(self, text1: str, text2: str) -> float:
@@ -743,7 +1537,8 @@ REMINDER: Non-answers = all 0. Correct answers = 7-10. Use varied feedback opene
         return dot / (mag1 * mag2) if mag1 * mag2 > 0 else 0.0
 
     def _compute_keyword_overlap(self, answer: str, question: str, ideal: str) -> float:
-        """Compute keyword overlap between answer and (question + ideal answer)."""
+        """Compute keyword overlap between answer and (question + ideal answer).
+        Uses both exact matching AND fuzzy matching for speech-garbled terms."""
         stop = self._FILLER_WORDS
 
         def get_keys(t): return set(
@@ -756,8 +1551,51 @@ REMINDER: Non-answers = all 0. Correct answers = 7-10. Use varied feedback opene
         if not topic_keys:
             return 0.0
 
-        overlap = len(answer_keys & topic_keys)
-        return overlap / len(topic_keys)
+        # Exact overlap
+        exact_overlap = len(answer_keys & topic_keys)
+
+        # Fuzzy overlap: check for approximate matches
+        unmatched_topic = topic_keys - answer_keys
+        fuzzy_matches = 0
+        for tk in unmatched_topic:
+            for ak in answer_keys:
+                if self._fuzzy_keyword_match(ak, tk):
+                    fuzzy_matches += 1
+                    break
+
+        total_matches = exact_overlap + \
+            (fuzzy_matches * 0.7)  # Fuzzy matches count 70%
+        return min(1.0, total_matches / len(topic_keys))
+
+    def _compute_fuzzy_overlap(self, answer: str, question: str, ideal: str) -> float:
+        """Additional fuzzy overlap score that catches speech-garbled technical terms.
+        More lenient than keyword overlap — focuses on whether core concepts appear."""
+        stop = self._FILLER_WORDS
+        answer_words = [w for w in re.sub(r'[^a-z0-9\s]', '', answer).split()
+                        if len(w) > 2 and w not in stop]
+        ideal_words = [w for w in re.sub(r'[^a-z0-9\s]', '', ideal).split()
+                       if len(w) > 3 and w not in stop]
+
+        if not ideal_words or not answer_words:
+            return 0.0
+
+        # Only check the most important words from ideal (longer = more important)
+        important_ideal = sorted(
+            set(ideal_words), key=lambda w: len(w), reverse=True)[:15]
+
+        matches = 0
+        for iw in important_ideal:
+            # Check exact match first
+            if iw in answer_words:
+                matches += 1
+                continue
+            # Check fuzzy match
+            for aw in answer_words:
+                if self._fuzzy_keyword_match(aw, iw):
+                    matches += 0.8
+                    break
+
+        return min(1.0, matches / max(len(important_ideal), 1))
 
     def _create_error_response(self, error_message: str) -> Dict:
         return {
@@ -778,11 +1616,16 @@ _llm_evaluator: Optional[LLMEvaluator] = None
 
 
 def get_llm_evaluator(api_key: Optional[str] = None) -> LLMEvaluator:
-    """Get or create the LLM evaluator singleton."""
+    """Get or create the LLM evaluator singleton.
+
+    The singleton stores the server's default API key. Per-request user keys
+    should be passed to evaluate_answer(api_key=...) instead of here, so that
+    one user's key doesn't overwrite the default for all subsequent requests.
+    """
     global _llm_evaluator
     if _llm_evaluator is None:
         _llm_evaluator = LLMEvaluator(api_key=api_key)
     elif api_key and not _llm_evaluator.api_key:
-        # Accept a late-supplied API key
+        # Accept a late-supplied key only if the singleton has none
         _llm_evaluator.api_key = api_key
     return _llm_evaluator
