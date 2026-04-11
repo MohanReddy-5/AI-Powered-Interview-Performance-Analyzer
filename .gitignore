@@ -46,5 +46,5 @@ temp_*.webm
 temp_*.wav
 *.tmp
 
-# Model files (too large for git)
-client/public/models/
+# Model files — kept in git (only ~1MB, needed for face-api.js)
+# client/public/models/
